@@ -4,7 +4,7 @@ import os
 enum MiAPIError: LocalizedError {
     case notConnected
     case api(code: Int, message: String?)
-    case paginationLimit
+    case paginationLimit(key: String, page: Int, latestDate: String?)
     case cursorLoop
     case invalidResponse(String)
     case network(Error)
@@ -16,8 +16,9 @@ enum MiAPIError: LocalizedError {
             return "尚未登录小米服务"
         case .api(let code, let message):
             return "小米 API 错误（code=\(code)）：\(message ?? "未知")"
-        case .paginationLimit:
-            return "分页超过安全上限"
+        case .paginationLimit(let key, let page, let date):
+            let d = date ?? "未知时间"
+            return "[\(key)] 分页超安全上限(\(page)页)，当前卡在: \(d)"
         case .cursorLoop:
             return "分页游标循环，已终止"
         case .invalidResponse(let detail):
@@ -65,7 +66,7 @@ actor MiAPIClient {
     private var baseURL: String { MiRegion.current.baseURL }
     private let dataPath = "/app/v1/data/get_fitness_data_by_time"
     private let sportRecordsPath = "/app/v1/data/get_sport_records_by_time"
-    private let maxPages = 200
+    private let maxPages = 20000
 
     private var state: MiSessionState?
     private let session: URLSession
@@ -196,62 +197,119 @@ actor MiAPIClient {
     // MARK: - 分页拉取
 
     /// 按 key 拉取某时间区间的数据（对应 `_fetch_key`）。
-    func fetchData(key: String, startTime: Int, endTime: Int) async throws -> [MiItem] {
-        var items: [MiItem] = []
-        var nextKey: String?
-        var seen = Set<String>()
-        var page = 0
-        while true {
-            page += 1
-            guard page <= maxPages else { throw MiAPIError.paginationLimit }
-            let body = Self.dataString(
-                startTime: startTime, endTime: endTime, key: key, nextKey: nextKey
-            )
-            let result = try await signedRequest(path: dataPath, dataString: body)
+        func fetchData(key: String, startTime: Int, endTime: Int) async throws -> [MiItem] {
+            var items: [MiItem] = []
+            var nextKey: String?
+            var seen = Set<String>()
+            var page = 0
+            let dateFmt = DateFormatter()
+            dateFmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            let rangeStart = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(startTime)))
+            let rangeEnd = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(endTime)))
+            print("▶️ [开始拉取] [\(key)] 区间: \(rangeStart) ~ \(rangeEnd)")
 
-            if let list = result["data_list"] as? [[String: Any]] {
-                items.append(contentsOf: list.map(Self.makeItem))
+            while true {
+                page += 1
+                if page > maxPages {
+                    var lastDateStr: String?
+                    if let lastTs = items.last?.time {
+                        lastDateStr = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(lastTs)))
+                    }
+                    print("❌ [分页超限] [\(key)] 达到 \(maxPages) 页上限，最后一条数据时间: \(lastDateStr ?? "无")")
+                    throw MiAPIError.paginationLimit(key: key, page: page, latestDate: lastDateStr)
+                }
+
+                let body = Self.dataString(
+                    startTime: startTime, endTime: endTime, key: key, nextKey: nextKey
+                )
+                let result = try await signedRequest(path: dataPath, dataString: body)
+
+                var newCount = 0
+                if let list = result["data_list"] as? [[String: Any]] {
+                    let mapped = list.map(Self.makeItem)
+                    newCount = mapped.count
+                    items.append(contentsOf: mapped)
+                }
+
+                let hasMore = MiJSON.bool(result["has_more"]) ?? false
+                let cursor = MiJSON.string(result["next_key"])
+
+                var curDateStr = "无"
+                if let lastTs = items.last?.time {
+                    curDateStr = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(lastTs)))
+                }
+                print("  ↳ [\(key)] 第 \(page) 页: +\(newCount) 条 (累计 \(items.count) 条), 最新时间: \(curDateStr)")
+
+                if !hasMore || cursor == nil { break }
+                if seen.contains(cursor!) {
+                    print("❌ [游标死循环] [\(key)] 游标重复: \(cursor!)")
+                    throw MiAPIError.cursorLoop
+                }
+                seen.insert(cursor!)
+                nextKey = cursor
+                // 分页请求间隔，避免高频请求触发小米限流
+                try? await Task.sleep(nanoseconds: pageDelayNs)
             }
-            let hasMore = MiJSON.bool(result["has_more"]) ?? false
-            let cursor = MiJSON.string(result["next_key"])
-            if !hasMore || cursor == nil { break }
-            if seen.contains(cursor!) { throw MiAPIError.cursorLoop }
-            seen.insert(cursor!)
-            nextKey = cursor
-            // 分页请求间隔，避免高频请求触发小米限流
-            try? await Task.sleep(nanoseconds: pageDelayNs)
+            print("✅ [拉取完成] [\(key)] 共 \(page) 页, \(items.count) 条数据")
+            return items
         }
-        return items
-    }
-
     /// 拉取运动记录（对应 `_fetch_sport_records_by_time`）。
-    func fetchSportRecords(startTime: Int, endTime: Int) async throws -> [MiItem] {
-        var items: [MiItem] = []
-        var nextKey: String?
-        var seen = Set<String>()
-        var page = 0
-        while true {
-            page += 1
-            guard page <= maxPages else { throw MiAPIError.paginationLimit }
-            let body = Self.dataString(
-                startTime: startTime, endTime: endTime, key: "sport", limit: 50, nextKey: nextKey
-            )
-            let result = try await signedRequest(path: sportRecordsPath, dataString: body)
+        func fetchSportRecords(startTime: Int, endTime: Int) async throws -> [MiItem] {
+            var items: [MiItem] = []
+            var nextKey: String?
+            var seen = Set<String>()
+            var page = 0
+            let dateFmt = DateFormatter()
+            dateFmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            let rangeStart = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(startTime)))
+            let rangeEnd = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(endTime)))
+            print("▶️ [开始拉取] [运动记录] 区间: \(rangeStart) ~ \(rangeEnd)")
 
-            if let list = result["sport_records"] as? [[String: Any]] {
-                items.append(contentsOf: list.map(Self.makeItem))
+            while true {
+                page += 1
+                if page > maxPages {
+                    var lastDateStr: String?
+                    if let lastTs = items.last?.time {
+                        lastDateStr = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(lastTs)))
+                    }
+                    print("❌ [分页超限] [运动记录] 达到 \(maxPages) 页上限，最后一条数据时间: \(lastDateStr ?? "无")")
+                    throw MiAPIError.paginationLimit(key: "sport", page: page, latestDate: lastDateStr)
+                }
+
+                let body = Self.dataString(
+                    startTime: startTime, endTime: endTime, key: "sport", limit: 50, nextKey: nextKey
+                )
+                let result = try await signedRequest(path: sportRecordsPath, dataString: body)
+
+                var newCount = 0
+                if let list = result["sport_records"] as? [[String: Any]] {
+                    let mapped = list.map(Self.makeItem)
+                    newCount = mapped.count
+                    items.append(contentsOf: mapped)
+                }
+
+                let hasMore = MiJSON.bool(result["has_more"]) ?? false
+                let cursor = MiJSON.string(result["next_key"])
+
+                var curDateStr = "无"
+                if let lastTs = items.last?.time {
+                    curDateStr = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(lastTs)))
+                }
+                print("  ↳ [运动记录] 第 \(page) 页: +\(newCount) 条 (累计 \(items.count) 条), 最新时间: \(curDateStr)")
+
+                if !hasMore || cursor == nil { break }
+                if seen.contains(cursor!) {
+                    print("❌ [游标死循环] [运动记录] 游标重复: \(cursor!)")
+                    throw MiAPIError.cursorLoop
+                }
+                seen.insert(cursor!)
+                nextKey = cursor
+                // 分页请求间隔，避免高频请求触发小米限流
+                try? await Task.sleep(nanoseconds: pageDelayNs)
             }
-            let hasMore = MiJSON.bool(result["has_more"]) ?? false
-            let cursor = MiJSON.string(result["next_key"])
-            if !hasMore || cursor == nil { break }
-            if seen.contains(cursor!) { throw MiAPIError.cursorLoop }
-            seen.insert(cursor!)
-            nextKey = cursor
-            // 分页请求间隔，避免高频请求触发小米限流
-            try? await Task.sleep(nanoseconds: pageDelayNs)
+            print("✅ [拉取完成] [运动记录] 共 \(page) 页, \(items.count) 条数据")
+            return items
         }
-        return items
-    }
 
     // MARK: - 时间换算（中国区 +08:00）
 

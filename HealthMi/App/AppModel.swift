@@ -193,10 +193,13 @@ final class AppModel {
         currentSyncIndex = 0
         await engine?.clearCache()
         for type in types {
-            currentSyncIndex += 1
-            // 后台同步被系统取消时，尽早退出
-            if Task.isCancelled { break }
-            let highWater = SyncStateStore.state(for: type, in: modelContext)?.lastSyncedEnd
+                    currentSyncIndex += 1
+                    print("==================================================")
+                    print("🚀 [总进度 \(currentSyncIndex)/\(totalSyncCount)] 正在同步: \(type.displayName)")
+                    print("==================================================")
+                    // 后台同步被系统取消时，尽早退出
+                    if Task.isCancelled { break }
+                    let highWater = SyncStateStore.state(for: type, in: modelContext)?.lastSyncedEnd
             do {
                 if type == .stress {
                     // 压力数据不走 HealthKit，走 SwiftData
