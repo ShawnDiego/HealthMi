@@ -25,6 +25,32 @@ actor SyncEngine {
     /// 避免同一次同步中把 sleep key 下载三遍。按 (startTime, endTime) 命中缓存。
     private var sleepCache: (startTime: Int, endTime: Int, items: [MiItem])?
 
+    // MARK: - 临时诊断（排查重复写入用，可整段删除）
+
+    private var diagnostics: [DiagTypeRun] = []
+    private var lastSleepItems: [MiItem] = []
+
+    /// 取出并清空本次同步记录下来的诊断数据。
+    func takeDiagnostics() -> [DiagTypeRun] {
+        let result = diagnostics
+        diagnostics = []
+        return result
+    }
+
+    private func diagRawItems(_ items: [MiItem]) -> [DiagRawItem] {
+        items.map { item in
+            DiagRawItem(
+                time: item.time,
+                sid: item.sid,
+                zoneOffset: item.zoneOffset,
+                zoneName: item.zoneName,
+                key: item.key,
+                category: item.category,
+                payload: item.valueData.flatMap { String(data: $0, encoding: .utf8) }
+            )
+        }
+    }
+
     init(client: MiAPIClient = MiAPIClient(), writer: HealthWriter = HealthWriter()) {
         self.client = client
         self.writer = writer
@@ -57,22 +83,13 @@ actor SyncEngine {
     ///   - backfillDays: 回填天数（仅在无游标或 `forceBackfill` 时生效）
     ///   - forceBackfill: 为 true 时忽略游标，按 `backfillDays` 重新拉取历史
     func sync(
-        type: SyncDataType, highWater: Date?, backfillDays: Int, forceBackfill: Bool = false
+        type: SyncDataType, highWater: Date?, backfillDays: Int,
+        forceBackfill: Bool = false
     ) async throws -> SyncOutcome {
-        let now = Date()
-        let start: Date
-        if forceBackfill {
-            // 重新回填：忽略游标，按所选天数重拉历史
-            start = Calendar.current.date(byAdding: .day, value: -backfillDays, to: now) ?? now
-        } else if let highWater {
-            // 增量：从上次游标往前重叠一天，避免迟到数据被漏掉
-            start = Calendar.current.date(byAdding: .day, value: -overlapDays, to: highWater) ?? highWater
-        } else {
-            // 首次同步：按所选天数回填
-            start = Calendar.current.date(byAdding: .day, value: -backfillDays, to: now) ?? now
-        }
-        let startTime = MiAPIClient.dayStartEpoch(of: start)
-        let endTime = MiAPIClient.dayEndEpoch(of: now)
+        let (start, now, startTime, endTime) = syncWindow(
+            highWater: highWater, backfillDays: backfillDays,
+            forceBackfill: forceBackfill
+        )
 
         // 运动记录用 HKWorkoutBuilder 单独写入（不走通用分组保存）
         if type == .workouts {
@@ -82,40 +99,125 @@ actor SyncEngine {
             )
         }
 
+        lastSleepItems = []
         let groups = try await fetchAndMap(type: type, startTime: startTime, endTime: endTime)
+
+        // 取数窗口的起点：云端查询用的是「归零到当地 00:00」的时刻。
+        // 去重/删除必须使用**同一个下界**，否则 [dayStart(start), start) 区间内的样本
+        // 每次都会被重新拉取、又查不到「已存在」，从而被重复写入（实测每小时缝隙会重复
+        // 睡眠/心率/血氧样本，缝隙宽度 = 上次同步的钟点）。
+        let windowStart = Date(timeIntervalSince1970: TimeInterval(startTime))
+        // 上界同理：取数用的是「今天 23:59:59」，去重也必须用同一个上界。
+        // 云端会为当天预生成记录（如今天 08:00 的静息心率），它落在 [now, dayEnd] 之间：
+        // 每次同步都拉得到、却永远查不到「已存在」，于是每次都被重复写入。
+        let windowEnd = Date(timeIntervalSince1970: TimeInterval(endTime))
+
+        // 睡眠类（sleep / HRV / 呼吸频率）改为「按会话删除 + 重写」：
+        // 一晚的多条云端记录（is_uncomplete 中间版本）已由 MiParser 归并为最终版本，
+        // 这里按每个会话的覆盖区间删除**本 App 自己**写过的样本（含旧 UUID 方案、
+        // 含被丢弃的中间版本），再整批写入，因此增量和回填都能自动收敛历史脏数据。
+        let isSessionType = (type == .sleep || type == .respiratoryRate || type == .hrv)
+        let coverages = isSessionType ? MiParser.sleepSessionCoverages(lastSleepItems) : []
 
         var added = 0
         var fetched = 0
+        var diagGroups: [DiagGroup] = []
         for group in groups {
-            let existing = try await writer.existingExternalIDs(
-                ofType: group.sampleType, start: start, end: now
-            )
-            if forceBackfill {
-                // 重新回填 = 重写：删除范围内**我们已写入的所有样本**（外部 ID 匹配），再插入最新数据。
-                // 删除全部而非仅交集，是为了清理旧版写入的已废弃样本（如旧的整晚 asleep 聚合样本）。
-                // 分块删除，避免单个谓词过长（大量样本时）。
-                if !existing.isEmpty {
-                    let chunkSize = 500
-                    let all = Array(existing)
-                    for index in stride(from: 0, to: all.count, by: chunkSize) {
-                        let end = min(index + chunkSize, all.count)
-                        try await writer.delete(ofType: group.sampleType, externalIDs: Set(all[index..<end]))
-                    }
+            var inserted = 0
+            var deletedCount = 0
+            // 诊断：删除前先看清窗口内 HealthKit 实际持有什么
+            let audited = (try? await writer.audit(
+                ofType: group.sampleType, start: windowStart, end: windowEnd
+            )) ?? []
+            var existingCount = audited.count
+
+            if isSessionType {
+                let preUUIDs = Set(audited.compactMap(\.externalUUID))
+                for coverage in coverages {
+                    deletedCount += (try? await writer.deleteOwn(
+                        ofType: group.sampleType,
+                        start: Date(timeIntervalSince1970: TimeInterval(coverage.start)),
+                        end: Date(timeIntervalSince1970: TimeInterval(coverage.end))
+                    )) ?? 0
                 }
                 try await writer.save(group.objects)
-                added += group.objects.count
-            } else {
-                let fresh = group.objects.filter { object in
+                // "新增"按去重后仍然不存在的 UUID 统计：纯重写（数据被修正）时显示 +0，
+                // 只有真正新写入的会话才计入新增。
+                inserted = group.objects.filter { object in
                     guard let uuid = object.metadata?[HKMetadataKeyExternalUUID] as? String else {
                         return true
                     }
-                    return !existing.contains(uuid)
+                    return !preUUIDs.contains(uuid)
+                }.count
+                added += inserted
+            } else {
+                let existing = try await writer.existingExternalIDs(
+                    ofType: group.sampleType, start: windowStart, end: windowEnd
+                )
+                existingCount = existing.count
+                if forceBackfill {
+                    // 重新回填 = 重写：删除范围内**我们已写入的所有样本**（外部 ID 匹配），再插入最新数据。
+                    // 删除全部而非仅交集，是为了清理旧版写入的已废弃样本（如旧的整晚 asleep 聚合样本）。
+                    // 分块删除，避免单个谓词过长（大量样本时）。
+                    if !existing.isEmpty {
+                        let chunkSize = 500
+                        let all = Array(existing)
+                        for index in stride(from: 0, to: all.count, by: chunkSize) {
+                            let end = min(index + chunkSize, all.count)
+                            deletedCount += try await writer.delete(
+                                ofType: group.sampleType, externalIDs: Set(all[index..<end])
+                            )
+                        }
+                    }
+                    try await writer.save(group.objects)
+                    // 与增量路径一致："新增"只统计去重后确实不存在的 UUID，
+                    // 纯重写（回填修正）时显示 +0，拉取数仍然反映改写量。
+                    inserted = group.objects.filter { object in
+                        guard let uuid = object.metadata?[HKMetadataKeyExternalUUID] as? String else {
+                            return true
+                        }
+                        return !existing.contains(uuid)
+                    }.count
+                    added += inserted
+                } else {
+                    let fresh = group.objects.filter { object in
+                        guard let uuid = object.metadata?[HKMetadataKeyExternalUUID] as? String else {
+                            return true
+                        }
+                        return !existing.contains(uuid)
+                    }
+                    try await writer.save(fresh)
+                    added += fresh.count
+                    inserted = fresh.count
                 }
-                try await writer.save(fresh)
-                added += fresh.count
             }
             fetched += group.objects.count
+
+            // 临时诊断：记录去重窗口内 HealthKit 实际持有的样本（删除前的快照）
+            diagGroups.append(DiagGroup(
+                sampleTypeIdentifier: group.sampleType.identifier,
+                fetched: group.objects.count,
+                existingFound: existingCount,
+                inserted: inserted,
+                deleted: deletedCount,
+                dedupWindowStart: windowStart,
+                dedupWindowEnd: windowEnd,
+                existingSamplesInDedupWindow: audited
+            ))
         }
+
+        diagnostics.append(DiagTypeRun(
+            type: type.rawValue,
+            highWater: highWater,
+            start: start,
+            fetchWindowStart: Date(timeIntervalSince1970: TimeInterval(startTime)),
+            fetchWindowEnd: Date(timeIntervalSince1970: TimeInterval(endTime)),
+            now: now,
+            rawSleepItems: [.sleep, .respiratoryRate, .hrv].contains(type)
+                ? diagRawItems(lastSleepItems) : nil,
+            groups: diagGroups,
+            note: nil
+        ))
 
         return SyncOutcome(type: type, fetched: fetched, added: added, highWater: now)
     }
@@ -176,6 +278,7 @@ actor SyncEngine {
 
         case .sleep:
             let items = try await fetchSleepData(startTime: startTime, endTime: endTime)
+            lastSleepItems = items
             let samples = MiParser.sleepSessions(items).flatMap(TypeMapper.sleepSamples)
             return groupBySampleType(samples)
 
@@ -187,6 +290,7 @@ actor SyncEngine {
         case .respiratoryRate:
             // 呼吸频率数据来自睡眠记录的 avg_breath，按睡眠时段各写一条样本
             let items = try await fetchSleepData(startTime: startTime, endTime: endTime)
+            lastSleepItems = items
             let samples = MiParser.respiratoryRateSamples(items)
                 .compactMap(TypeMapper.respiratoryRateSample)
             return groupBySampleType(samples)
@@ -194,6 +298,7 @@ actor SyncEngine {
         case .hrv:
             // HRV 数据来自睡眠记录的 avg_hrv / hrv_median，按睡眠时段各写一条样本
             let items = try await fetchSleepData(startTime: startTime, endTime: endTime)
+            lastSleepItems = items
             let samples = MiParser.hrvSamples(items).compactMap(TypeMapper.hrvSample)
             return groupBySampleType(samples)
 

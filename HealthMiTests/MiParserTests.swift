@@ -63,6 +63,55 @@ final class MiParserTests: XCTestCase {
         XCTAssertEqual(session.stageSummary[.rem], 30)
     }
 
+    /// 云端同一晚会返回多个「中间版本」（`is_uncomplete = true`，wake_up_time 越写越晚）。
+    /// 应只保留最终版本，且 sleepId 按夜晚（sid + bedtime）稳定。
+    func testSleepMergesIncompleteRecords() {
+        let bedtime = 1_790_610_000
+        func record(wakeOffsetHours: Int, uncomplete: Bool) -> MiItem {
+            let value: [String: Any] = [
+                "bedtime": bedtime,
+                "wake_up_time": bedtime + wakeOffsetHours * 3600,
+                "is_uncomplete": uncomplete,
+                "duration": 300,
+                "items": [["start_time": bedtime, "end_time": bedtime + 1800, "state": 2]],
+            ]
+            return item(time: bedtime + wakeOffsetHours * 3600, value: value, sid: "s1")
+        }
+        // 顺序打乱，最终版本放在中间，确保归并不依赖输入顺序
+        let sessions = MiParser.sleepSessions([
+            record(wakeOffsetHours: 5, uncomplete: true),
+            record(wakeOffsetHours: 8, uncomplete: false),
+            record(wakeOffsetHours: 3, uncomplete: true),
+        ])
+        XCTAssertEqual(sessions.count, 1, "同一会话的中间版本必须被丢弃")
+        let session = sessions[0]
+        XCTAssertEqual(session.sleepId, "s1_\(bedtime)", "sleepId 必须按夜晚稳定，不随 wake_up_time 变化")
+        XCTAssertEqual(session.endAt, Date(timeIntervalSince1970: Double(bedtime + 8 * 3600)))
+        XCTAssertEqual(session.segments.count, 1)
+
+        // 覆盖区间要涵盖同组所有版本（用于清理旧样本）
+        let coverages = MiParser.sleepSessionCoverages([
+            record(wakeOffsetHours: 5, uncomplete: true),
+            record(wakeOffsetHours: 8, uncomplete: false),
+        ])
+        XCTAssertEqual(coverages.count, 1)
+        XCTAssertEqual(coverages[0].start, bedtime)
+        XCTAssertEqual(coverages[0].end, bedtime + 8 * 3600)
+
+        // 不同 bedtime（例如午睡）不能被并入同一会话
+        let nap: [String: Any] = [
+            "bedtime": bedtime + 14 * 3600,
+            "wake_up_time": bedtime + 15 * 3600,
+            "is_uncomplete": false,
+            "items": [],
+        ]
+        let two = MiParser.sleepSessions([
+            record(wakeOffsetHours: 8, uncomplete: false),
+            item(time: bedtime + 15 * 3600, value: nap, sid: "s1"),
+        ])
+        XCTAssertEqual(two.count, 2, "不同 bedtime 的会话（午睡）不应被合并")
+    }
+
     func testWorkoutsParsing() {
         let start = 1_782_000_000
         let value = #"{"start_time": 1782000000, "end_time": 1782003600, "duration": 3600, "distance": 10000, "calories": 500, "avg_hrm": 140, "max_hrm": 175}"#

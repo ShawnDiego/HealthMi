@@ -43,6 +43,42 @@ actor HealthWriter {
         try await store.save(batch)
     }
 
+    // MARK: - 临时诊断（可整段删除）
+
+    /// 读取窗口内该类型的**全部**样本（不要求带 externalUUID），
+    /// 用于看清 HealthKit 里到底有什么（含旧版无 metadata 的样本和其它 App 的样本）。
+    func audit(ofType type: HKSampleType, start: Date, end: Date, limit: Int = 5000) async throws -> [DiagSample] {
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end)
+        let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+        return try await withCheckedThrowingContinuation { continuation in
+            let query = HKSampleQuery(
+                sampleType: type, predicate: predicate, limit: limit, sortDescriptors: [sort]
+            ) { _, samples, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                let mapped: [DiagSample] = (samples ?? []).map { sample in
+                    var value: String?
+                    if let category = sample as? HKCategorySample {
+                        value = "category:\(category.value)"
+                    } else if let quantity = sample as? HKQuantitySample {
+                        value = "\(quantity.quantity)"
+                    }
+                    return DiagSample(
+                        start: sample.startDate,
+                        end: sample.endDate,
+                        value: value,
+                        externalUUID: sample.metadata?[HKMetadataKeyExternalUUID] as? String,
+                        source: sample.sourceRevision.source.bundleIdentifier
+                    )
+                }
+                continuation.resume(returning: mapped)
+            }
+            store.execute(query)
+        }
+    }
+
     /// 用 `HKWorkoutBuilder` 构建并保存一条运动记录。
     /// 保留 externalUUID metadata（builder 支持 addMetadata），继续用于去重。
     /// 若草稿包含心率数据，创建关联心率样本并挂载到运动记录上。
@@ -112,6 +148,28 @@ actor HealthWriter {
             withMetadataKey: HKMetadataKeyExternalUUID,
             allowedValues: Array(externalIDs)
         )
+        return try await withCheckedThrowingContinuation { continuation in
+            store.deleteObjects(of: type, predicate: predicate) { _, count, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: count)
+                }
+            }
+        }
+    }
+
+    /// 删除**本 App** 在 `[start, end]` 内写入的该类型样本，返回删除数量。
+    ///
+    /// 谓词同时限定「来源 == 本 App」与时间范围（软边界，跨越窗口起点的样本也会命中）。
+    /// 因此既能清掉旧版 UUID 方案写下的样本、以及被丢弃的中间版本样本，
+    /// 又**绝不会**碰到 Apple Watch 或其它 App 写入的健康数据。
+    @discardableResult
+    func deleteOwn(ofType type: HKSampleType, start: Date, end: Date) async throws -> Int {
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+            HKQuery.predicateForObjects(from: HKSource.default()),
+            HKQuery.predicateForSamples(withStart: start, end: end),
+        ])
         return try await withCheckedThrowingContinuation { continuation in
             store.deleteObjects(of: type, predicate: predicate) { _, count, error in
                 if let error {
