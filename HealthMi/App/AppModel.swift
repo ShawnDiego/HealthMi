@@ -168,6 +168,7 @@ final class AppModel {
         isSyncing = true
         lastError = nil
         defer { isSyncing = false }
+        let diagnosticStartedAt = Date()
 
         // 新增类型（如呼吸频率）可能还没授权，先补齐授权，否则写入会被 HealthKit 拒绝
         await ensureHealthKitAuthorization()
@@ -259,6 +260,44 @@ final class AppModel {
         // 后台同步失败时发送本地通知
         if isBackground, let lastError {
             await NotificationManager.notifySyncFailure(lastError)
+        }
+        // 临时诊断：把本次同步的窗口、云端原始数据与 HealthKit 现状落盘（可整段删除）
+        await writeDiagnosticDump(startedAt: diagnosticStartedAt, forceBackfill: forceBackfill)
+    }
+
+    // MARK: - 同步诊断记录（可长期开启；移除方法见 AppLog 中 DiagnosticDump 注释）
+
+    /// 写入 `Documents/healthmi_diagnostic_<时间戳>_<incremental|backfill>.json`：
+    /// 本次同步各类型的窗口、云端睡眠原始数据、去重查询命中的样本，
+    /// 以及 HealthKit 里实际存在的睡眠/步数样本。**不写入任何凭据。**
+    private func writeDiagnosticDump(startedAt: Date, forceBackfill: Bool) async {
+        guard let engine else { return }
+        let types = await engine.takeDiagnostics()
+        let now = Date()
+        let writer = HealthWriter()
+        let sleepAudit = (try? await writer.audit(
+            ofType: HKCategoryType(.sleepAnalysis),
+            start: now.addingTimeInterval(-10 * 86_400), end: now, limit: 20_000
+        )) ?? []
+        let stepAudit = (try? await writer.audit(
+            ofType: HKQuantityType(.stepCount),
+            start: now.addingTimeInterval(-3 * 86_400), end: now, limit: 5_000
+        )) ?? []
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let run = DiagRun(
+            appVersion: version,
+            startedAt: startedAt,
+            finishedAt: now,
+            forceBackfill: forceBackfill,
+            backfillDays: backfillDays,
+            types: types,
+            healthKitSleepAudit: sleepAudit,
+            healthKitStepAudit: stepAudit,
+            note: "同步诊断：窗口/云端原始数据/去重决策/HealthKit 现状"
+        )
+        // 编码+写盘（约 200–450 KB）放到后台线程，避免阻塞主线程
+        Task.detached(priority: .utility) {
+            DiagnosticDump.write(run)
         }
     }
 

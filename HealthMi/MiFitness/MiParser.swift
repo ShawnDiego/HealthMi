@@ -49,24 +49,96 @@ enum MiParser {
 
     // MARK: - 睡眠
 
-    /// 对应 `iter_sleep_sessions`。分段（stages）保留精确起止时间，供 HealthKit 精细写入。
-    static func sleepSessions(_ items: [MiItem]) -> [MiSleepSession] {
-        var sessions: [MiSleepSession] = []
+    /// 归并后的一个睡眠会话（云端同一晚的多个中间版本只保留最终版本）。
+    struct MergedSleepRecord {
+        let payload: [String: Any]
+        /// 形如 `737797243_1790614680`（sid + bedtime）：**按夜晚稳定**，
+        /// 不会随云端继续延后 wake_up_time 而变化。
+        let sleepId: String
+        let bedtime: Int
+        let wake: Int
+        /// 该会话所有版本共同覆盖的时间范围，供同步引擎清理旧版/中间版本写下的样本。
+        let coverageStart: Int
+        let coverageEnd: Int
+    }
+
+    /// 把云端睡眠记录按「同一会话」归并，只保留最终版本。
+    ///
+    /// 实机验证（2026-09-21/22/29/30 四晚，与小米运动健康官方 App 逐项一致）：
+    /// 手环在用户每次短暂醒来时会把同一段睡眠重新定稿一次——`sid` 与 `bedtime` 都不变，
+    /// 只有 `wake_up_time` 越写越晚，并且中间版本带 `is_uncomplete = true`。
+    /// 云端把这些版本全部保留，官方 App 只展示 `is_uncomplete = false` 的那一条。
+    /// 若不归并，一晚会被写成多条互相嵌套的 inBed + 多套分期，同一时段会同时落在两个睡眠类别。
+    static func mergedSleepRecords(_ items: [MiItem]) -> [MergedSleepRecord] {
+        struct Raw {
+            let item: MiItem
+            let payload: [String: Any]
+            let sid: String
+            let bedtime: Int
+            let wake: Int
+            let isUncomplete: Bool?
+        }
+        var raws: [Raw] = []
         for item in items {
             let payload = valueObject(item)
-            let sleepStart = firstInt(payload, "bedtime", "device_bedtime", "bed_timestamp")
-            let sleepEnd = firstInt(payload, "wake_up_time", "device_wake_up_time", "out_bed_timestamp")
-                ?? item.time
-            guard let start = sleepStart, let end = sleepEnd else { continue }
+            guard let start = firstInt(payload, "bedtime", "device_bedtime", "bed_timestamp"),
+                  let end = firstInt(payload, "wake_up_time", "device_wake_up_time", "out_bed_timestamp")
+                      ?? item.time,
+                  end > start
+            else { continue }
+            raws.append(Raw(
+                item: item, payload: payload,
+                sid: item.sid ?? "unknown",
+                bedtime: start, wake: end,
+                isUncomplete: MiJSON.bool(payload["is_uncomplete"])
+            ))
+        }
 
-            let startAt = Date(timeIntervalSince1970: Double(start))
-            let endAt = Date(timeIntervalSince1970: Double(end))
+        // 按 sid + bedtime 聚类（允许 2 分钟偏差，防止云端微调 bedtime 导致分组失败；
+        // 午睡与主睡眠的 bedtime 相差数小时，不会被误并）。
+        let sorted = raws.sorted { ($0.sid, $0.bedtime) < ($1.sid, $1.bedtime) }
+        var groups: [[Raw]] = []
+        for record in sorted {
+            if let head = groups.last?.first,
+               head.sid == record.sid,
+               abs(head.bedtime - record.bedtime) <= 120 {
+                groups[groups.count - 1].append(record)
+            } else {
+                groups.append([record])
+            }
+        }
+
+        return groups.compactMap { group in
+            // 优先取官方认定的最终版本；缺失该字段时退化为 wake_up_time 最晚的一条。
+            guard let keep = group.first(where: { $0.isUncomplete == false })
+                    ?? group.max(by: { $0.wake < $1.wake })
+            else { return nil }
+            return MergedSleepRecord(
+                payload: keep.payload,
+                sleepId: "\(keep.sid)_\(keep.bedtime)",
+                bedtime: keep.bedtime,
+                wake: keep.wake,
+                coverageStart: group.map(\.bedtime).min() ?? keep.bedtime,
+                coverageEnd: group.map(\.wake).max() ?? keep.wake
+            )
+        }
+    }
+
+    /// 各睡眠会话的覆盖区间（epoch 秒），供同步引擎按来源清理自己写过的样本。
+    static func sleepSessionCoverages(_ items: [MiItem]) -> [(start: Int, end: Int)] {
+        mergedSleepRecords(items).map { ($0.coverageStart, $0.coverageEnd) }
+    }
+
+    /// 对应 `iter_sleep_sessions`。分段（stages）保留精确起止时间，供 HealthKit 精细写入。
+    static func sleepSessions(_ items: [MiItem]) -> [MiSleepSession] {
+        mergedSleepRecords(items).map { record in
+            let payload = record.payload
+            // 云端 `duration` 已是「不含清醒」的睡眠时长（实机校验：duration + awake = 起床-入睡）。
             let duration = MiJSON.int(payload["duration"])
-                ?? max(0, (end - start) / 60)
+                ?? max(0, (record.wake - record.bedtime) / 60)
             let awake = MiJSON.int(payload["awake_duration"])
                 ?? MiJSON.int(payload["sleep_awake_duration"])
                 ?? 0
-            let asleep = max(0, duration - awake)
 
             var segments: [MiSleepSegment] = []
             if let rawSegments = payload["items"] as? [[String: Any]] {
@@ -83,21 +155,18 @@ enum MiParser {
                 }
             }
 
-            let sid = item.sid ?? "unknown"
-            let sleepId = "\(sid)_\(item.time ?? end)"
-            sessions.append(MiSleepSession(
-                sleepId: sleepId,
-                startAt: startAt,
-                endAt: endAt,
+            return MiSleepSession(
+                sleepId: record.sleepId,
+                startAt: Date(timeIntervalSince1970: Double(record.bedtime)),
+                endAt: Date(timeIntervalSince1970: Double(record.wake)),
                 durationMinutes: duration,
-                timeAsleepMinutes: asleep,
+                timeAsleepMinutes: max(0, duration),
                 timeAwakeMinutes: awake,
                 sleepScore: MiJSON.int(payload["score"]) ?? MiJSON.int(payload["sleep_score"]),
                 isNap: MiJSON.bool(payload["is_nap"]) ?? false,
                 segments: segments
-            ))
+            )
         }
-        return sessions
     }
 
     /// 睡眠 state 编码（实测交叉验证：分段分钟数 = 顶层 sleep_*_duration）：
@@ -179,19 +248,17 @@ enum MiParser {
     // MARK: - 心率变异性（睡眠 HRV）
 
     /// 从睡眠记录提取 HRV（优先 `avg_hrv`，回退 `hrv_median`），单位毫秒。
+    /// 与 `sleepSessions` 共用同一份归并结果，避免中间版本多写一条。
     static func hrvSamples(_ items: [MiItem]) -> [MiHRVSample] {
-        items.compactMap { item in
-            let payload = valueObject(item)
-            let sdnn = MiJSON.int(payload["avg_hrv"]) ?? MiJSON.int(payload["hrv_median"])
-            guard let sdnn, sdnn > 0 else { return nil }
-            let start = firstInt(payload, "bedtime", "device_bedtime", "bed_timestamp") ?? item.time
-            let end = firstInt(payload, "wake_up_time", "device_wake_up_time", "out_bed_timestamp") ?? item.time
-            guard let start, let end, end > start else { return nil }
-            let sleepId = "\(item.sid ?? "unknown")_\(item.time ?? end)"
+        mergedSleepRecords(items).compactMap { record in
+            let payload = record.payload
+            guard let sdnn = MiJSON.int(payload["avg_hrv"]) ?? MiJSON.int(payload["hrv_median"]),
+                  sdnn > 0
+            else { return nil }
             return MiHRVSample(
-                sleepId: sleepId,
-                startAt: Date(timeIntervalSince1970: Double(start)),
-                endAt: Date(timeIntervalSince1970: Double(end)),
+                sleepId: record.sleepId,
+                startAt: Date(timeIntervalSince1970: Double(record.bedtime)),
+                endAt: Date(timeIntervalSince1970: Double(record.wake)),
                 sdnnMs: sdnn
             )
         }
@@ -200,18 +267,15 @@ enum MiParser {
     // MARK: - 呼吸频率（睡眠平均）
 
     /// 从睡眠记录提取 `avg_breath`（每次睡眠的平均呼吸频率）。
+    /// 与 `sleepSessions` 共用同一份归并结果，避免中间版本多写一条。
     static func respiratoryRateSamples(_ items: [MiItem]) -> [MiRespiratoryRateSample] {
-        items.compactMap { item in
-            let payload = valueObject(item)
+        mergedSleepRecords(items).compactMap { record in
+            let payload = record.payload
             guard let breaths = MiJSON.int(payload["avg_breath"]), breaths > 0 else { return nil }
-            let start = firstInt(payload, "bedtime", "device_bedtime", "bed_timestamp") ?? item.time
-            let end = firstInt(payload, "wake_up_time", "device_wake_up_time", "out_bed_timestamp") ?? item.time
-            guard let start, let end, end > start else { return nil }
-            let sleepId = "\(item.sid ?? "unknown")_\(item.time ?? end)"
             return MiRespiratoryRateSample(
-                sleepId: sleepId,
-                startAt: Date(timeIntervalSince1970: Double(start)),
-                endAt: Date(timeIntervalSince1970: Double(end)),
+                sleepId: record.sleepId,
+                startAt: Date(timeIntervalSince1970: Double(record.bedtime)),
+                endAt: Date(timeIntervalSince1970: Double(record.wake)),
                 breathsPerMinute: breaths
             )
         }
