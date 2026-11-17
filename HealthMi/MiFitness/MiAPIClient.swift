@@ -58,6 +58,9 @@ actor MiAPIClient {
     static var regionTimeZone: TimeZone { MiRegion.current.timeZone }
 
 
+    /// 单次时间切片最大跨度（天数）。大范围回填按此粒度分段请求，避免单段触发分页上限。
+    static let maxChunkDays = 30
+
     /// 最多重试次数（不含首次请求）。
     private let maxRetries = 3
     /// 分页请求间隔（纳秒），避免高频请求触发小米限流。
@@ -66,10 +69,12 @@ actor MiAPIClient {
     private var baseURL: String { MiRegion.current.baseURL }
     private let dataPath = "/app/v1/data/get_fitness_data_by_time"
     private let sportRecordsPath = "/app/v1/data/get_sport_records_by_time"
-    private let maxPages = 20000
+    private let maxPages = 200
 
     private var state: MiSessionState?
     private let session: URLSession
+    /// 复用日志时间戳格式化器（固定 en_US_POSIX，格式化时绑定当前区域时区）。
+    private let logDateFormatter: DateFormatter
 
     init() {
         let config = URLSessionConfiguration.ephemeral
@@ -78,6 +83,7 @@ actor MiAPIClient {
         config.httpShouldSetCookies = false
         config.timeoutIntervalForRequest = 30
         self.session = URLSession(configuration: config)
+        self.logDateFormatter = Self.makeLogDateFormatter()
     }
 
     var isConnected: Bool { state != nil }
@@ -107,15 +113,18 @@ actor MiAPIClient {
         let retries = maxRetries
         var lastError: Error?
         for attempt in 0...retries {
+            try Task.checkCancellation()
             if attempt > 0 {
                 // 指数退避：1s → 2s → 4s，加 0–200ms 随机抖动
                 let baseDelay = UInt64(pow(2.0, Double(attempt - 1))) * 1_000_000_000
                 let jitter = UInt64.random(in: 0...200_000_000)
                 AppLog.apiClient.info("重试 \(attempt)/\(retries) path=\(path)")
-                try? await Task.sleep(nanoseconds: baseDelay + jitter)
+                try await Task.sleep(nanoseconds: baseDelay + jitter)
             }
             do {
                 return try await signedRequestOnce(path: path, dataString: dataString)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch let error as MiAPIError {
                 if error.isAuthError || !error.isRetriable {
                     throw error
@@ -197,121 +206,165 @@ actor MiAPIClient {
     // MARK: - 分页拉取
 
     /// 按 key 拉取某时间区间的数据（对应 `_fetch_key`）。
-        func fetchData(key: String, startTime: Int, endTime: Int) async throws -> [MiItem] {
-            var items: [MiItem] = []
-            var nextKey: String?
-            var seen = Set<String>()
-            var page = 0
-            let dateFmt = DateFormatter()
-            dateFmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
-            let rangeStart = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(startTime)))
-            let rangeEnd = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(endTime)))
-            print("▶️ [开始拉取] [\(key)] 区间: \(rangeStart) ~ \(rangeEnd)")
+    func fetchData(key: String, startTime: Int, endTime: Int) async throws -> [MiItem] {
+        try await fetchPaginated(
+            key: key,
+            logLabel: key,
+            path: dataPath,
+            listKey: "data_list",
+            limit: nil,
+            startTime: startTime,
+            endTime: endTime
+        )
+    }
 
-            while true {
-                page += 1
-                if page > maxPages {
-                    var lastDateStr: String?
-                    if let lastTs = items.last?.time {
-                        lastDateStr = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(lastTs)))
-                    }
-                    print("❌ [分页超限] [\(key)] 达到 \(maxPages) 页上限，最后一条数据时间: \(lastDateStr ?? "无")")
-                    throw MiAPIError.paginationLimit(key: key, page: page, latestDate: lastDateStr)
-                }
-
-                let body = Self.dataString(
-                    startTime: startTime, endTime: endTime, key: key, nextKey: nextKey
-                )
-                let result = try await signedRequest(path: dataPath, dataString: body)
-
-                var newCount = 0
-                if let list = result["data_list"] as? [[String: Any]] {
-                    let mapped = list.map(Self.makeItem)
-                    newCount = mapped.count
-                    items.append(contentsOf: mapped)
-                }
-
-                let hasMore = MiJSON.bool(result["has_more"]) ?? false
-                let cursor = MiJSON.string(result["next_key"])
-
-                var curDateStr = "无"
-                if let lastTs = items.last?.time {
-                    curDateStr = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(lastTs)))
-                }
-                print("  ↳ [\(key)] 第 \(page) 页: +\(newCount) 条 (累计 \(items.count) 条), 最新时间: \(curDateStr)")
-
-                if !hasMore || cursor == nil { break }
-                if seen.contains(cursor!) {
-                    print("❌ [游标死循环] [\(key)] 游标重复: \(cursor!)")
-                    throw MiAPIError.cursorLoop
-                }
-                seen.insert(cursor!)
-                nextKey = cursor
-                // 分页请求间隔，避免高频请求触发小米限流
-                try? await Task.sleep(nanoseconds: pageDelayNs)
-            }
-            print("✅ [拉取完成] [\(key)] 共 \(page) 页, \(items.count) 条数据")
-            return items
-        }
     /// 拉取运动记录（对应 `_fetch_sport_records_by_time`）。
-        func fetchSportRecords(startTime: Int, endTime: Int) async throws -> [MiItem] {
-            var items: [MiItem] = []
-            var nextKey: String?
-            var seen = Set<String>()
-            var page = 0
-            let dateFmt = DateFormatter()
-            dateFmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
-            let rangeStart = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(startTime)))
-            let rangeEnd = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(endTime)))
-            print("▶️ [开始拉取] [运动记录] 区间: \(rangeStart) ~ \(rangeEnd)")
+    func fetchSportRecords(startTime: Int, endTime: Int) async throws -> [MiItem] {
+        try await fetchPaginated(
+            key: "sport",
+            logLabel: "运动记录",
+            path: sportRecordsPath,
+            listKey: "sport_records",
+            limit: 50,
+            startTime: startTime,
+            endTime: endTime
+        )
+    }
 
-            while true {
-                page += 1
-                if page > maxPages {
-                    var lastDateStr: String?
-                    if let lastTs = items.last?.time {
-                        lastDateStr = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(lastTs)))
-                    }
-                    print("❌ [分页超限] [运动记录] 达到 \(maxPages) 页上限，最后一条数据时间: \(lastDateStr ?? "无")")
-                    throw MiAPIError.paginationLimit(key: "sport", page: page, latestDate: lastDateStr)
-                }
+    /// 按时间切片 + 单段分页拉取通用逻辑。
+    /// 若请求跨度超过 `maxChunkDays`，自动切分为连续时间段依次拉取，单段内由 `maxPages` 保护，
+    /// 每页及切片间均执行 `Task.checkCancellation()`。
+    private func fetchPaginated(
+        key: String,
+        logLabel: String,
+        path: String,
+        listKey: String,
+        limit: Int?,
+        startTime: Int,
+        endTime: Int
+    ) async throws -> [MiItem] {
+        let chunks = Self.timeChunks(startTime: startTime, endTime: endTime, chunkDays: Self.maxChunkDays)
+        var allItems: [MiItem] = []
 
-                let body = Self.dataString(
-                    startTime: startTime, endTime: endTime, key: "sport", limit: 50, nextKey: nextKey
-                )
-                let result = try await signedRequest(path: sportRecordsPath, dataString: body)
-
-                var newCount = 0
-                if let list = result["sport_records"] as? [[String: Any]] {
-                    let mapped = list.map(Self.makeItem)
-                    newCount = mapped.count
-                    items.append(contentsOf: mapped)
-                }
-
-                let hasMore = MiJSON.bool(result["has_more"]) ?? false
-                let cursor = MiJSON.string(result["next_key"])
-
-                var curDateStr = "无"
-                if let lastTs = items.last?.time {
-                    curDateStr = dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(lastTs)))
-                }
-                print("  ↳ [运动记录] 第 \(page) 页: +\(newCount) 条 (累计 \(items.count) 条), 最新时间: \(curDateStr)")
-
-                if !hasMore || cursor == nil { break }
-                if seen.contains(cursor!) {
-                    print("❌ [游标死循环] [运动记录] 游标重复: \(cursor!)")
-                    throw MiAPIError.cursorLoop
-                }
-                seen.insert(cursor!)
-                nextKey = cursor
-                // 分页请求间隔，避免高频请求触发小米限流
-                try? await Task.sleep(nanoseconds: pageDelayNs)
-            }
-            print("✅ [拉取完成] [运动记录] 共 \(page) 页, \(items.count) 条数据")
-            return items
+        for chunk in chunks {
+            try Task.checkCancellation()
+            let chunkItems = try await fetchSingleChunk(
+                key: key,
+                logLabel: logLabel,
+                path: path,
+                listKey: listKey,
+                limit: limit,
+                startTime: chunk.startTime,
+                endTime: chunk.endTime
+            )
+            allItems.append(contentsOf: chunkItems)
         }
+        return allItems
+    }
 
-    // MARK: - 时间换算（中国区 +08:00）
+    private func fetchSingleChunk(
+        key: String,
+        logLabel: String,
+        path: String,
+        listKey: String,
+        limit: Int?,
+        startTime: Int,
+        endTime: Int
+    ) async throws -> [MiItem] {
+        var items: [MiItem] = []
+        var nextKey: String?
+        var seen = Set<String>()
+        var page = 0
+        let rangeStart = formatEpoch(startTime)
+        let rangeEnd = formatEpoch(endTime)
+        AppLog.apiClient.info(
+            "开始拉取 [\(logLabel, privacy: .public)] 区间: \(rangeStart, privacy: .public) ~ \(rangeEnd, privacy: .public)"
+        )
+
+        while true {
+            try Task.checkCancellation()
+            page += 1
+            if page > maxPages {
+                let lastDateStr = items.last?.time.map(formatEpoch)
+                AppLog.apiClient.error(
+                    "分页超限 [\(logLabel, privacy: .public)] 达到 \(self.maxPages, privacy: .public) 页上限，最后一条数据时间: \(lastDateStr ?? "无", privacy: .public)"
+                )
+                throw MiAPIError.paginationLimit(key: key, page: page, latestDate: lastDateStr)
+            }
+
+            let body = Self.dataString(
+                startTime: startTime, endTime: endTime, key: key, limit: limit, nextKey: nextKey
+            )
+            let result = try await signedRequest(path: path, dataString: body)
+
+            var newCount = 0
+            if let list = result[listKey] as? [[String: Any]] {
+                let mapped = list.map(Self.makeItem)
+                newCount = mapped.count
+                items.append(contentsOf: mapped)
+            }
+
+            let hasMore = MiJSON.bool(result["has_more"]) ?? false
+            let cursor = MiJSON.string(result["next_key"])
+            let curDateStr = items.last?.time.map(formatEpoch) ?? "无"
+            AppLog.apiClient.debug(
+                "[\(logLabel, privacy: .public)] 第 \(page, privacy: .public) 页: +\(newCount, privacy: .public) 条 (累计 \(items.count, privacy: .public) 条), 最新时间: \(curDateStr, privacy: .public)"
+            )
+
+            guard hasMore, let cursor else { break }
+            if seen.contains(cursor) {
+                AppLog.apiClient.error("游标死循环 [\(logLabel, privacy: .public)] 游标重复: \(cursor, privacy: .public)")
+                throw MiAPIError.cursorLoop
+            }
+            seen.insert(cursor)
+            nextKey = cursor
+            // 分页请求间隔，避免高频请求触发小米限流
+            try await Task.sleep(nanoseconds: pageDelayNs)
+        }
+        AppLog.apiClient.info(
+            "拉取完成 [\(logLabel, privacy: .public)] 共 \(page, privacy: .public) 页, \(items.count, privacy: .public) 条数据"
+        )
+        return items
+    }
+
+    // MARK: - 时间换算与切片（绑定区域时区）
+
+    /// 将大时间区间按固定天数（默认 `maxChunkDays = 30`）切分为首尾相接的子区间。
+    static func timeChunks(
+        startTime: Int, endTime: Int, chunkDays: Int = maxChunkDays
+    ) -> [(startTime: Int, endTime: Int)] {
+        guard startTime <= endTime, chunkDays > 0 else { return [] }
+        let chunkSpan = chunkDays * 86_400
+        var chunks: [(startTime: Int, endTime: Int)] = []
+        var currentStart = startTime
+        while currentStart <= endTime {
+            let currentEnd = min(currentStart + chunkSpan - 1, endTime)
+            chunks.append((startTime: currentStart, endTime: currentEnd))
+            if currentEnd >= endTime { break }
+            currentStart = currentEnd + 1
+        }
+        return chunks
+    }
+
+    /// 创建绑定 `en_US_POSIX` 与指定时区（默认区域时区）的日志时间格式化器。
+    static func makeLogDateFormatter(timeZone: TimeZone = regionTimeZone) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }
+
+    /// 按指定时区（默认当前区域时区）将秒级时间戳格式化为 `yyyy-MM-dd HH:mm:ss`。
+    static func formatTimestamp(_ epoch: Int, timeZone: TimeZone = regionTimeZone) -> String {
+        makeLogDateFormatter(timeZone: timeZone)
+            .string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
+    }
+
+    private func formatEpoch(_ epoch: Int) -> String {
+        logDateFormatter.timeZone = Self.regionTimeZone
+        return logDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
+    }
 
     /// 某日历日 00:00:00(+08:00) 的时间戳。
     static func dayStartEpoch(of day: Date) -> Int {
