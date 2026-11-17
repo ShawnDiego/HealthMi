@@ -97,17 +97,24 @@ final class SyncEngineTests: XCTestCase {
 
         // 3650 天（含首尾日历日）按 30 天切片应拆分为 122 段
         XCTAssertEqual(slices.count, 122)
-        XCTAssertEqual(slices.first?.start, overall.start)
         XCTAssertEqual(slices.first?.startTime, overall.startTime)
-        XCTAssertEqual(slices.last?.end, overall.end)
         XCTAssertEqual(slices.last?.endTime, overall.endTime)
+        XCTAssertEqual(slices.last?.highWater, overall.end)
 
-        for idx in 1..<slices.count {
-            XCTAssertEqual(slices[idx].startTime, slices[idx - 1].endTime + 1)
-            XCTAssertLessThanOrEqual(
-                slices[idx].endTime - slices[idx].startTime + 1,
-                30 * 86_400
-            )
+        for (idx, slice) in slices.enumerated() {
+            // 去重窗口必须严格贴齐取数窗口边界（00:00:00 ~ 23:59:59），防止首末段产生缝隙重复写入
+            XCTAssertEqual(slice.start, Date(timeIntervalSince1970: TimeInterval(slice.startTime)))
+            XCTAssertEqual(slice.end, Date(timeIntervalSince1970: TimeInterval(slice.endTime)))
+            if idx < slices.count - 1 {
+                XCTAssertEqual(slice.highWater, slice.end)
+            }
+            if idx > 0 {
+                XCTAssertEqual(slice.startTime, slices[idx - 1].endTime + 1)
+                XCTAssertLessThanOrEqual(
+                    slice.endTime - slice.startTime + 1,
+                    30 * 86_400
+                )
+            }
         }
     }
 }

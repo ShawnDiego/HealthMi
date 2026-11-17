@@ -10,11 +10,15 @@ struct SyncOutcome: Sendable {
 }
 
 /// 分段同步的时间切片。
+/// `start` / `end` 与取数时间戳 `startTime` / `endTime` 严格对齐（含首段 00:00:00 与末段 23:59:59），
+/// 确保 HealthKit 去重查询窗口完整覆盖取数窗口，避免缝隙内样本被重复写入；
+/// `highWater` 在中间切片取 `end`，在末段取同步发起时刻 `now`，避免游标超前推进。
 struct SyncWindowSlice: Sendable, Equatable {
     let start: Date
     let end: Date
     let startTime: Int
     let endTime: Int
+    let highWater: Date
 }
 
 /// 同步引擎：取数 → 解析 → 映射 → 幂等写入。
@@ -64,31 +68,6 @@ actor SyncEngine {
         self.userId = userId
     }
 
-    /// 同步一类数据（按时间切片逐段拉取并写入）。
-    /// - Parameters:
-    ///   - highWater: 上次游标；`nil` 表示首次同步
-    ///   - backfillDays: 回填天数（仅在无游标或 `forceBackfill` 时生效）
-    ///   - forceBackfill: 为 true 时忽略游标，按 `backfillDays` 重新拉取历史
-    func sync(
-        type: SyncDataType, highWater: Date?, backfillDays: Int, forceBackfill: Bool = false
-    ) async throws -> SyncOutcome {
-        let slices = syncWindows(
-            highWater: highWater, backfillDays: backfillDays, forceBackfill: forceBackfill
-        )
-        var totalFetched = 0
-        var totalAdded = 0
-        var latestEnd = Date()
-
-        for slice in slices {
-            try Task.checkCancellation()
-            let outcome = try await syncSlice(type: type, slice: slice, forceBackfill: forceBackfill)
-            totalFetched += outcome.fetched
-            totalAdded += outcome.added
-            latestEnd = outcome.highWater
-        }
-        return SyncOutcome(type: type, fetched: totalFetched, added: totalAdded, highWater: latestEnd)
-    }
-
     /// 同步单个时间切片的数据，供调用方在每段完成后立即持久化游标。
     func syncSlice(
         type: SyncDataType, slice: SyncWindowSlice, forceBackfill: Bool = false
@@ -99,7 +78,8 @@ actor SyncEngine {
         if type == .workouts {
             return try await syncWorkouts(
                 startTime: slice.startTime, endTime: slice.endTime,
-                start: slice.start, end: slice.end, forceBackfill: forceBackfill
+                start: slice.start, end: slice.end, highWater: slice.highWater,
+                forceBackfill: forceBackfill
             )
         }
 
@@ -150,33 +130,11 @@ actor SyncEngine {
             fetched += group.objects.count
         }
 
-        return SyncOutcome(type: type, fetched: fetched, added: added, highWater: slice.end)
-    }
-
-    /// 压力数据同步：从云端拉取 stress key，返回解析后的压力样本。
-    /// 压力数据无 HealthKit 对应类型，由 AppModel 写入 SwiftData。
-    /// - Returns: (压力样本列表, 同步结果摘要)
-    func syncStress(
-        highWater: Date?, backfillDays: Int, forceBackfill: Bool = false
-    ) async throws -> (samples: [MiStressSample], outcome: SyncOutcome) {
-        let slices = syncWindows(
-            highWater: highWater, backfillDays: backfillDays, forceBackfill: forceBackfill
-        )
-        var allSamples: [MiStressSample] = []
-        var latestEnd = Date()
-        for slice in slices {
-            try Task.checkCancellation()
-            let samples = try await fetchStressSlice(slice: slice)
-            allSamples.append(contentsOf: samples)
-            latestEnd = slice.end
-        }
-        return (
-            allSamples,
-            SyncOutcome(type: .stress, fetched: allSamples.count, added: 0, highWater: latestEnd)
-        )
+        return SyncOutcome(type: type, fetched: fetched, added: added, highWater: slice.highWater)
     }
 
     /// 拉取单个时间切片的压力数据样本。
+    /// 压力数据无 HealthKit 对应类型，由 AppModel 按切片写入 SwiftData。
     func fetchStressSlice(slice: SyncWindowSlice) async throws -> [MiStressSample] {
         try Task.checkCancellation()
         let items = try await client.fetchData(
@@ -206,24 +164,22 @@ actor SyncEngine {
         highWater: Date?, backfillDays: Int, forceBackfill: Bool,
         chunkDays: Int = MiAPIClient.maxChunkDays, now: Date = Date()
     ) -> [SyncWindowSlice] {
-        let overall = syncWindow(
+        let (_, overallEnd, startTime, endTime) = syncWindow(
             highWater: highWater, backfillDays: backfillDays, forceBackfill: forceBackfill, now: now
         )
         let chunks = MiAPIClient.timeChunks(
-            startTime: overall.startTime, endTime: overall.endTime, chunkDays: chunkDays
+            startTime: startTime, endTime: endTime, chunkDays: chunkDays
         )
         return chunks.enumerated().map { index, chunk in
-            let sliceStart = index == 0
-                ? overall.start
-                : Date(timeIntervalSince1970: TimeInterval(chunk.startTime))
-            let sliceEnd = index == chunks.count - 1
-                ? overall.end
-                : Date(timeIntervalSince1970: TimeInterval(chunk.endTime))
+            let sliceStart = Date(timeIntervalSince1970: TimeInterval(chunk.startTime))
+            let sliceEnd = Date(timeIntervalSince1970: TimeInterval(chunk.endTime))
+            let highWater = index == chunks.count - 1 ? overallEnd : sliceEnd
             return SyncWindowSlice(
                 start: sliceStart,
                 end: sliceEnd,
                 startTime: chunk.startTime,
-                endTime: chunk.endTime
+                endTime: chunk.endTime,
+                highWater: highWater
             )
         }
     }
@@ -280,18 +236,18 @@ actor SyncEngine {
             return groupBySampleType(samples)
 
         case .stress:
-            // 压力数据不走 HealthKit，由 syncStress 方法处理
+            // 压力数据不走 HealthKit，由 fetchStressSlice 方法处理
             return []
 
         case .workouts:
-            // 不会走到这里：sync() 已将运动路由到 syncWorkouts（HKWorkoutBuilder 专用）
+            // 不会走到这里：syncSlice() 已将运动路由到 syncWorkouts（HKWorkoutBuilder 专用）
             return []
         }
     }
 
     /// 运动记录：取数 → 生成草稿 → 用 HKWorkoutBuilder 逐条写入（按 externalUUID 去重）。
     private func syncWorkouts(
-        startTime: Int, endTime: Int, start: Date, end: Date, forceBackfill: Bool
+        startTime: Int, endTime: Int, start: Date, end: Date, highWater: Date, forceBackfill: Bool
     ) async throws -> SyncOutcome {
         let items = try await client.fetchSportRecords(startTime: startTime, endTime: endTime)
         let drafts = MiParser.workouts(items).compactMap(TypeMapper.workoutDraft)
@@ -322,7 +278,7 @@ actor SyncEngine {
                 added += 1
             }
         }
-        return SyncOutcome(type: .workouts, fetched: drafts.count, added: added, highWater: end)
+        return SyncOutcome(type: .workouts, fetched: drafts.count, added: added, highWater: highWater)
     }
 
     private func recordWrittenIDs(from objects: [HKObject]) {

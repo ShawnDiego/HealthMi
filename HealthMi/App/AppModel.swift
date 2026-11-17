@@ -224,10 +224,10 @@ final class AppModel {
                         let added = StressStore.save(samples: samples, in: modelContext)
                         totalFetched += samples.count
                         totalAdded += added
-                        latestHighWater = slice.end
+                        latestHighWater = slice.highWater
                         SyncStateStore.record(
-                            type: .stress, highWater: slice.end,
-                            added: totalAdded, in: modelContext
+                            type: .stress, highWater: slice.highWater,
+                            added: added, in: modelContext
                         )
                     }
                     let outcome = SyncOutcome(
@@ -251,7 +251,7 @@ final class AppModel {
                         latestHighWater = sliceOutcome.highWater
                         SyncStateStore.record(
                             type: type, highWater: sliceOutcome.highWater,
-                            added: totalAdded, in: modelContext
+                            added: sliceOutcome.added, in: modelContext
                         )
                     }
                     let outcome = SyncOutcome(
