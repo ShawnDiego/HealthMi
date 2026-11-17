@@ -112,6 +112,80 @@ final class MiParserTests: XCTestCase {
         XCTAssertEqual(two.count, 2, "不同 bedtime 的会话（午睡）不应被合并")
     }
 
+
+    /// 同一晚若被云端重新定稿两次（两条都是 `is_uncomplete == false`），
+    /// 必须取 wake_up_time 最晚者，且结果不能随云端返回顺序变化。
+    func testSleepPrefersLatestFinalVersionRegardlessOfOrder() {
+        let bedtime = 1_790_610_000
+        func final(wakeHours: Int) -> MiItem {
+            item(
+                time: bedtime + wakeHours * 3600,
+                value: [
+                    "bedtime": bedtime,
+                    "wake_up_time": bedtime + wakeHours * 3600,
+                    "is_uncomplete": false,
+                    "items": [],
+                ],
+                sid: "s1"
+            )
+        }
+        let ascending = MiParser.sleepSessions([final(wakeHours: 6), final(wakeHours: 9)])
+        let descending = MiParser.sleepSessions([final(wakeHours: 9), final(wakeHours: 6)])
+        XCTAssertEqual(ascending.count, 1)
+        XCTAssertEqual(descending.count, 1)
+        let expected = Date(timeIntervalSince1970: Double(bedtime + 9 * 3600))
+        XCTAssertEqual(ascending[0].endAt, expected, "应取 wake_up_time 最晚的最终版本")
+        XCTAssertEqual(descending[0].endAt, expected, "结果不能依赖输入顺序")
+        XCTAssertEqual(ascending[0].sleepId, descending[0].sleepId, "sleepId 必须稳定")
+    }
+
+    /// bedtime 链式漂移（A≈B、B≈C，但 A 与 C 差 240s）时，同一晚仍必须归并为 1 组，
+    /// 否则会退化成「一晚两条 inBed」。
+    func testSleepGroupsTransitiveBedtimeDrift() {
+        let bedtime = 1_790_610_000
+        func record(driftSeconds: Int, uncomplete: Bool) -> MiItem {
+            let bed = bedtime + driftSeconds
+            return item(
+                time: bed + 5 * 3600,
+                value: [
+                    "bedtime": bed,
+                    "wake_up_time": bed + 5 * 3600,
+                    "is_uncomplete": uncomplete,
+                    "items": [],
+                ],
+                sid: "s1"
+            )
+        }
+        let sessions = MiParser.sleepSessions([
+            record(driftSeconds: 0, uncomplete: false),
+            record(driftSeconds: 119, uncomplete: true),
+            record(driftSeconds: 238, uncomplete: true),
+        ])
+        XCTAssertEqual(sessions.count, 1, "链式漂移的同一晚不应被拆成多条")
+        XCTAssertEqual(sessions[0].sleepId, "s1_\(bedtime)", "sleepId 锚定组内最早 bedtime，保持稳定")
+    }
+
+    /// 云端不返回 `duration` 时，睡眠时长必须扣掉清醒时长，而不是把整段卧床时间当作睡眠。
+    func testSleepDurationFallbackExcludesAwake() {
+        let bedtime = 1_790_610_000
+        let session = MiParser.sleepSessions([
+            item(
+                time: bedtime + 8 * 3600,
+                value: [
+                    "bedtime": bedtime,
+                    "wake_up_time": bedtime + 8 * 3600,
+                    "is_uncomplete": false,
+                    "awake_duration": 60,
+                    "items": [],
+                ],
+                sid: "s1"
+            )
+        ])[0]
+        XCTAssertEqual(session.timeAwakeMinutes, 60)
+        XCTAssertEqual(session.durationMinutes, 7 * 60, "8h 卧床 - 1h 清醒 = 7h 睡眠")
+        XCTAssertEqual(session.timeAsleepMinutes, 7 * 60)
+    }
+
     func testWorkoutsParsing() {
         let start = 1_782_000_000
         let value = #"{"start_time": 1782000000, "end_time": 1782003600, "duration": 3600, "distance": 10000, "calories": 500, "avg_hrm": 140, "max_hrm": 175}"#

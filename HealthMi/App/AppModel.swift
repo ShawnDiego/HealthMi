@@ -276,8 +276,10 @@ final class AppModel {
         if isBackground, let lastError {
             await NotificationManager.notifySyncFailure(lastError)
         }
-        // 临时诊断：把本次同步的窗口、云端原始数据与 HealthKit 现状落盘（可整段删除）
-        await writeDiagnosticDump(startedAt: diagnosticStartedAt, forceBackfill: forceBackfill)
+        // 临时诊断：仅在诊断开关打开时落盘（默认关闭，避免每次同步都做额外全窗口查询与 IO）
+        if SyncEngine.isDiagnosticEnabled {
+            await writeDiagnosticDump(startedAt: diagnosticStartedAt, forceBackfill: forceBackfill)
+        }
     }
 
     // MARK: - 同步诊断记录（可长期开启；移除方法见 AppLog 中 DiagnosticDump 注释）

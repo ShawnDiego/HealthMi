@@ -26,6 +26,14 @@ actor SyncEngine {
     private var sleepCache: (startTime: Int, endTime: Int, items: [MiItem])?
 
     // MARK: - 临时诊断（排查重复写入用，可整段删除）
+    //
+    // 诊断会额外做全窗口 HK 查询并落盘几百 KB JSON，**默认关闭**。
+    // 打开方式：`defaults write com.healthmi.HealthMi diagnostic_dump_enabled -bool YES`。
+
+    /// 诊断是否开启。关闭时跳过全部 audit 查询与落盘。
+    nonisolated static var isDiagnosticEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "diagnostic_dump_enabled")
+    }
 
     private var diagnostics: [DiagTypeRun] = []
     private var lastSleepItems: [MiItem] = []
@@ -91,26 +99,24 @@ actor SyncEngine {
             forceBackfill: forceBackfill
         )
 
+        // 去重/删除窗口必须与云端取数窗口完全一致：
+        // 取数用 dayStartEpoch(start) / dayEndEpoch(now)，去重也必须用同一对边界。
+        // 否则 [dayStart(start), start) 与 [now, dayEnd] 这两段里的样本每次都会被重新拉取、
+        // 又查不到「已存在」，从而被重复写入（缝隙宽度 = 上次同步的钟点）。
+        let windowStart = Date(timeIntervalSince1970: TimeInterval(startTime))
+        let windowEnd = Date(timeIntervalSince1970: TimeInterval(endTime))
+
         // 运动记录用 HKWorkoutBuilder 单独写入（不走通用分组保存）
         if type == .workouts {
             return try await syncWorkouts(
-                startTime: startTime, endTime: endTime, start: start, end: now,
+                startTime: startTime, endTime: endTime,
+                windowStart: windowStart, windowEnd: windowEnd,
                 forceBackfill: forceBackfill
             )
         }
 
         lastSleepItems = []
         let groups = try await fetchAndMap(type: type, startTime: startTime, endTime: endTime)
-
-        // 取数窗口的起点：云端查询用的是「归零到当地 00:00」的时刻。
-        // 去重/删除必须使用**同一个下界**，否则 [dayStart(start), start) 区间内的样本
-        // 每次都会被重新拉取、又查不到「已存在」，从而被重复写入（实测每小时缝隙会重复
-        // 睡眠/心率/血氧样本，缝隙宽度 = 上次同步的钟点）。
-        let windowStart = Date(timeIntervalSince1970: TimeInterval(startTime))
-        // 上界同理：取数用的是「今天 23:59:59」，去重也必须用同一个上界。
-        // 云端会为当天预生成记录（如今天 08:00 的静息心率），它落在 [now, dayEnd] 之间：
-        // 每次同步都拉得到、却永远查不到「已存在」，于是每次都被重复写入。
-        let windowEnd = Date(timeIntervalSince1970: TimeInterval(endTime))
 
         // 睡眠类（sleep / HRV / 呼吸频率）改为「按会话删除 + 重写」：
         // 一晚的多条云端记录（is_uncomplete 中间版本）已由 MiParser 归并为最终版本，
@@ -121,18 +127,32 @@ actor SyncEngine {
 
         var added = 0
         var fetched = 0
+        let auditing = Self.isDiagnosticEnabled
         var diagGroups: [DiagGroup] = []
         for group in groups {
             var inserted = 0
             var deletedCount = 0
-            // 诊断：删除前先看清窗口内 HealthKit 实际持有什么
-            let audited = (try? await writer.audit(
-                ofType: group.sampleType, start: windowStart, end: windowEnd
-            )) ?? []
+            // 诊断：删除前先看清窗口内 HealthKit 实际持有什么。
+            // 仅在诊断开关打开时执行——全窗口 HKSampleQuery 对每种类型都不便宜。
+            var audited: [DiagSample] = []
+            if auditing {
+                audited = (try? await writer.audit(
+                    ofType: group.sampleType, start: windowStart, end: windowEnd
+                )) ?? []
+            }
             var existingCount = audited.count
 
             if isSessionType {
-                let preUUIDs = Set(audited.compactMap(\.externalUUID))
+                // 关闭诊断时也要知道「写入前已存在哪些」，用于统计真正新增的会话数
+                let preUUIDs: Set<String>
+                if auditing {
+                    preUUIDs = Set(audited.compactMap(\.externalUUID))
+                } else {
+                    preUUIDs = try await writer.existingExternalIDs(
+                        ofType: group.sampleType, start: windowStart, end: windowEnd
+                    )
+                }
+                existingCount = preUUIDs.count
                 for coverage in coverages {
                     deletedCount += (try? await writer.deleteOwn(
                         ofType: group.sampleType,
@@ -194,30 +214,34 @@ actor SyncEngine {
             fetched += group.objects.count
 
             // 临时诊断：记录去重窗口内 HealthKit 实际持有的样本（删除前的快照）
-            diagGroups.append(DiagGroup(
-                sampleTypeIdentifier: group.sampleType.identifier,
-                fetched: group.objects.count,
-                existingFound: existingCount,
-                inserted: inserted,
-                deleted: deletedCount,
-                dedupWindowStart: windowStart,
-                dedupWindowEnd: windowEnd,
-                existingSamplesInDedupWindow: audited
-            ))
+            if auditing {
+                diagGroups.append(DiagGroup(
+                    sampleTypeIdentifier: group.sampleType.identifier,
+                    fetched: group.objects.count,
+                    existingFound: existingCount,
+                    inserted: inserted,
+                    deleted: deletedCount,
+                    dedupWindowStart: windowStart,
+                    dedupWindowEnd: windowEnd,
+                    existingSamplesInDedupWindow: audited
+                ))
+            }
         }
 
-        diagnostics.append(DiagTypeRun(
-            type: type.rawValue,
-            highWater: highWater,
-            start: start,
-            fetchWindowStart: Date(timeIntervalSince1970: TimeInterval(startTime)),
-            fetchWindowEnd: Date(timeIntervalSince1970: TimeInterval(endTime)),
-            now: now,
-            rawSleepItems: [.sleep, .respiratoryRate, .hrv].contains(type)
-                ? diagRawItems(lastSleepItems) : nil,
-            groups: diagGroups,
-            note: nil
-        ))
+        if auditing {
+            diagnostics.append(DiagTypeRun(
+                type: type.rawValue,
+                highWater: highWater,
+                start: start,
+                fetchWindowStart: Date(timeIntervalSince1970: TimeInterval(startTime)),
+                fetchWindowEnd: Date(timeIntervalSince1970: TimeInterval(endTime)),
+                now: now,
+                rawSleepItems: [.sleep, .respiratoryRate, .hrv].contains(type)
+                    ? diagRawItems(lastSleepItems) : nil,
+                groups: diagGroups,
+                note: nil
+            ))
+        }
 
         return SyncOutcome(type: type, fetched: fetched, added: added, highWater: now)
     }
@@ -318,13 +342,17 @@ actor SyncEngine {
     }
 
     /// 运动记录：取数 → 生成草稿 → 用 HKWorkoutBuilder 逐条写入（按 externalUUID 去重）。
+    /// 去重窗口必须用 `windowStart`/`windowEnd`（与云端取数窗口一致），不能用精确 `start`，
+    /// 否则 [dayStart(start), start) 区间内的运动记录每次都会被重新写入。
     private func syncWorkouts(
-        startTime: Int, endTime: Int, start: Date, end: Date, forceBackfill: Bool
+        startTime: Int, endTime: Int, windowStart: Date, windowEnd: Date, forceBackfill: Bool
     ) async throws -> SyncOutcome {
         let items = try await client.fetchSportRecords(startTime: startTime, endTime: endTime)
         let drafts = MiParser.workouts(items).compactMap(TypeMapper.workoutDraft)
         let workoutType = HKObjectType.workoutType() as HKSampleType
-        let existing = try await writer.existingExternalIDs(ofType: workoutType, start: start, end: end)
+        let existing = try await writer.existingExternalIDs(
+            ofType: workoutType, start: windowStart, end: windowEnd
+        )
 
         var added = 0
         for draft in drafts {

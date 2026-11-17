@@ -96,12 +96,15 @@ enum MiParser {
 
         // 按 sid + bedtime 聚类（允许 2 分钟偏差，防止云端微调 bedtime 导致分组失败；
         // 午睡与主睡眠的 bedtime 相差数小时，不会被误并）。
+        //
+        // 必须与组内**任意**成员比较，不能只与组头比较：云端逐次微调 bedtime 会出现链式漂移
+        //（A≈B、B≈C，但 A 与 C 差 240s），只比组头会把同一晚拆成两组，又变回一晚两条 inBed。
         let sorted = raws.sorted { ($0.sid, $0.bedtime) < ($1.sid, $1.bedtime) }
         var groups: [[Raw]] = []
         for record in sorted {
-            if let head = groups.last?.first,
-               head.sid == record.sid,
-               abs(head.bedtime - record.bedtime) <= 120 {
+            if let last = groups.last,
+               last.first?.sid == record.sid,
+               last.contains(where: { abs($0.bedtime - record.bedtime) <= 120 }) {
                 groups[groups.count - 1].append(record)
             } else {
                 groups.append([record])
@@ -109,16 +112,22 @@ enum MiParser {
         }
 
         return groups.compactMap { group in
-            // 优先取官方认定的最终版本；缺失该字段时退化为 wake_up_time 最晚的一条。
-            guard let keep = group.first(where: { $0.isUncomplete == false })
-                    ?? group.max(by: { $0.wake < $1.wake })
+            // 只在官方认定的最终版本（is_uncomplete == false）里取 wake_up_time 最晚的一条；
+            // 该字段缺失（或全为 true）时退化为整组 wake 最晚者。
+            // 不能用 `first(where:)`：同一晚被重新定稿两次（两条都是 false）时，
+            // 取哪条会取决于云端返回顺序，同一份数据会写出不同的入睡/醒来时间。
+            let finals = group.filter { $0.isUncomplete == false }
+            guard let keep = (finals.isEmpty ? group : finals).max(by: { $0.wake < $1.wake })
             else { return nil }
+            // sleepId 用组内最早 bedtime 作锚：链式漂移时组内 bedtime 会浮动，
+            // 用 min 可保证同一晚的 UUID 稳定（coverageStart 本来就是这个值）。
+            let anchorBedtime = group.map(\.bedtime).min() ?? keep.bedtime
             return MergedSleepRecord(
                 payload: keep.payload,
-                sleepId: "\(keep.sid)_\(keep.bedtime)",
+                sleepId: "\(keep.sid)_\(anchorBedtime)",
                 bedtime: keep.bedtime,
                 wake: keep.wake,
-                coverageStart: group.map(\.bedtime).min() ?? keep.bedtime,
+                coverageStart: anchorBedtime,
                 coverageEnd: group.map(\.wake).max() ?? keep.wake
             )
         }
@@ -133,12 +142,13 @@ enum MiParser {
     static func sleepSessions(_ items: [MiItem]) -> [MiSleepSession] {
         mergedSleepRecords(items).map { record in
             let payload = record.payload
-            // 云端 `duration` 已是「不含清醒」的睡眠时长（实机校验：duration + awake = 起床-入睡）。
-            let duration = MiJSON.int(payload["duration"])
-                ?? max(0, (record.wake - record.bedtime) / 60)
             let awake = MiJSON.int(payload["awake_duration"])
                 ?? MiJSON.int(payload["sleep_awake_duration"])
                 ?? 0
+            // 云端 `duration` 已是「不含清醒」的睡眠时长（实机校验：duration + awake = 起床-入睡）。
+            // duration 缺失时必须减掉 awake，否则会把整段卧床时间（含清醒）当成睡眠时长。
+            let duration = MiJSON.int(payload["duration"])
+                ?? max(0, (record.wake - record.bedtime) / 60 - awake)
 
             var segments: [MiSleepSegment] = []
             if let rawSegments = payload["items"] as? [[String: Any]] {
