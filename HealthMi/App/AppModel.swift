@@ -1,6 +1,7 @@
 import Foundation
 import HealthKit
 import Observation
+import os
 import SwiftData
 
 enum AppError: LocalizedError {
@@ -161,10 +162,24 @@ final class AppModel {
         }
     }
 
+    /// 跨实例并发同步互斥：前台 UI、快捷指令 Intent、BGTask 后台刷新可能用不同的
+    /// AppModel 实例，同时跑会读到相同的增量游标导致重复写入。
+    private static let syncActivity = OSAllocatedUnfairLock(initialState: false)
+
     /// - Parameters:
     ///   - forceBackfill: 为 true 时忽略增量游标，按 `backfillDays` 重新回填历史。
     ///   - isBackground: 是否为后台同步触发（失败时发送本地通知）。
     func syncAll(modelContext: ModelContext, forceBackfill: Bool = false, isBackground: Bool = false) async {
+        guard Self.syncActivity.withLock({ state in
+            if state { return false }
+            state = true
+            return true
+        }) else {
+            statusMessage = "已有同步在进行中，已跳过本次触发"
+            return
+        }
+        defer { Self.syncActivity.withLock { $0 = false } }
+
         isSyncing = true
         lastError = nil
         defer { isSyncing = false }

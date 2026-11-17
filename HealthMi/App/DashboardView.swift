@@ -228,11 +228,6 @@ struct DashboardView: View {
             }
             .task {
                 await model.refreshSummary()
-                // App Intent 触发时自动开始同步
-                if SyncIntentTrigger.shouldSync {
-                    SyncIntentTrigger.shouldSync = false
-                    await model.syncAll(modelContext: modelContext)
-                }
             }
             .refreshable { await model.syncAll(modelContext: modelContext) }
             .sheet(isPresented: Binding(

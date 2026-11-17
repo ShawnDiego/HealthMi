@@ -2,6 +2,17 @@
 
 本文件记录 HealthMi 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [未发布]
+
+### 新增
+
+- **快捷指令静默后台同步**：「同步健康数据」App Intent 改为不打开 App（`openAppWhenRun = false`），`perform()` 直接执行完整同步（含超时看门狗 55 秒优雅取消），可搭配快捷指令"特定时间"自动化实现每日定时无人值守同步，同步结果以对话框回显
+- **跨实例并发同步互斥**：前台 UI、快捷指令 Intent、BGTask 后台刷新使用不同 `AppModel` 实例，`syncAll` 用 `OSAllocatedUnfairLock` 保证同一时刻只有一个同步在跑，避免读到相同增量游标造成重复写入
+
+### 修复
+
+- **BGTask 处理器注册时机**：从 `.task`（依赖 UI 出现）移到 `App.init()`，进程被杀后后台拉起时场景不出现也能正确注册，避免后台同步静默失效；`register` 加防重复注册保护
+
 ## [1.1.0] - 2026-08-16
 
 ### 新增

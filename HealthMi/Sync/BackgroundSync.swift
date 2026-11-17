@@ -9,8 +9,13 @@ enum BackgroundSync {
     /// 当前后台同步 Task 引用，用于 expirationHandler 取消。
     @MainActor private static var syncTask: Task<Void, Never>?
 
+    /// BGTask 处理器只能注册一次，重复注册同一标识符会抛异常。
+    @MainActor private static var didRegister = false
+
     @MainActor
     static func register(syncHandler: @escaping @MainActor () async -> Void) {
+        guard !didRegister else { return }
+        didRegister = true
         BGTaskScheduler.shared.register(forTaskWithIdentifier: taskIdentifier, using: nil) { task in
             guard let refreshTask = task as? BGAppRefreshTask else {
                 task.setTaskCompleted(success: false)
