@@ -37,4 +37,84 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertLessThan(result.start, result.end)
         XCTAssertLessThan(result.startTime, result.endTime)
     }
+
+    func testPaginationLimitErrorDescription() {
+        let withDate = MiAPIError.paginationLimit(
+            key: "heart_rate", page: 201, latestDate: "2026-09-20 12:30:00"
+        )
+        XCTAssertEqual(
+            withDate.errorDescription,
+            "[heart_rate] 分页超安全上限(201页)，当前卡在: 2026-09-20 12:30:00"
+        )
+
+        let withoutDate = MiAPIError.paginationLimit(
+            key: "steps", page: 201, latestDate: nil
+        )
+        XCTAssertEqual(
+            withoutDate.errorDescription,
+            "[steps] 分页超安全上限(201页)，当前卡在: 未知时间"
+        )
+    }
+
+    func testLogDateFormatterUsesPosixLocaleAndRegionTimeZone() {
+        let shanghai = TimeZone(identifier: "Asia/Shanghai")!
+        let utc = TimeZone(secondsFromGMT: 0)!
+        let formatter = MiAPIClient.makeLogDateFormatter(timeZone: shanghai)
+        XCTAssertEqual(formatter.locale.identifier, "en_US_POSIX")
+        XCTAssertEqual(formatter.timeZone, shanghai)
+
+        // 1970-01-01 00:00:00 UTC == 1970-01-01 08:00:00 +08:00
+        XCTAssertEqual(MiAPIClient.formatTimestamp(0, timeZone: utc), "1970-01-01 00:00:00")
+        XCTAssertEqual(MiAPIClient.formatTimestamp(0, timeZone: shanghai), "1970-01-01 08:00:00")
+    }
+
+    func testTimeChunksSplittingAndContinuity() {
+        let start = 1_700_000_000
+        let totalDays = 65
+        let end = start + totalDays * 86_400 - 1
+        let chunks = MiAPIClient.timeChunks(startTime: start, endTime: end, chunkDays: 30)
+
+        XCTAssertEqual(chunks.count, 3)
+        XCTAssertEqual(chunks[0].startTime, start)
+        XCTAssertEqual(chunks[0].endTime, start + 30 * 86_400 - 1)
+        XCTAssertEqual(chunks[1].startTime, chunks[0].endTime + 1)
+        XCTAssertEqual(chunks[1].endTime, start + 60 * 86_400 - 1)
+        XCTAssertEqual(chunks[2].startTime, chunks[1].endTime + 1)
+        XCTAssertEqual(chunks[2].endTime, end)
+
+        // 反向非法区间应返回空数组
+        XCTAssertTrue(MiAPIClient.timeChunks(startTime: 100, endTime: 50, chunkDays: 30).isEmpty)
+    }
+
+    func testSyncWindowsMultiYearSlicesCoverFullRange() async {
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let overall = await engine.syncWindow(
+            highWater: nil, backfillDays: 3650, forceBackfill: true, now: now
+        )
+        let slices = await engine.syncWindows(
+            highWater: nil, backfillDays: 3650, forceBackfill: true, chunkDays: 30, now: now
+        )
+
+        // 3650 天（含首尾日历日）按 30 天切片应拆分为 122 段
+        XCTAssertEqual(slices.count, 122)
+        XCTAssertEqual(slices.first?.startTime, overall.startTime)
+        XCTAssertEqual(slices.last?.endTime, overall.endTime)
+        XCTAssertEqual(slices.last?.highWater, overall.end)
+
+        for (idx, slice) in slices.enumerated() {
+            // 去重窗口必须严格贴齐取数窗口边界（00:00:00 ~ 23:59:59），防止首末段产生缝隙重复写入
+            XCTAssertEqual(slice.start, Date(timeIntervalSince1970: TimeInterval(slice.startTime)))
+            XCTAssertEqual(slice.end, Date(timeIntervalSince1970: TimeInterval(slice.endTime)))
+            if idx < slices.count - 1 {
+                XCTAssertEqual(slice.highWater, slice.end)
+            }
+            if idx > 0 {
+                XCTAssertEqual(slice.startTime, slices[idx - 1].endTime + 1)
+                XCTAssertLessThanOrEqual(
+                    slice.endTime - slice.startTime + 1,
+                    30 * 86_400
+                )
+            }
+        }
+    }
 }
