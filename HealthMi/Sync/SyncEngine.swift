@@ -9,6 +9,18 @@ struct SyncOutcome: Sendable {
     let highWater: Date
 }
 
+/// 分段同步的时间切片。
+/// `start` / `end` 与取数时间戳 `startTime` / `endTime` 严格对齐（含首段 00:00:00 与末段 23:59:59），
+/// 确保 HealthKit 去重查询窗口完整覆盖取数窗口，避免缝隙内样本被重复写入；
+/// `highWater` 在中间切片取 `end`，在末段取同步发起时刻 `now`，避免游标超前推进。
+struct SyncWindowSlice: Sendable, Equatable {
+    let start: Date
+    let end: Date
+    let startTime: Int
+    let endTime: Int
+    let highWater: Date
+}
+
 /// 同步引擎：取数 → 解析 → 映射 → 幂等写入。
 ///
 /// 写法与已验证的 Python 工具保持一致：每次按类型从云端拉取时间区间数据，
@@ -22,8 +34,11 @@ actor SyncEngine {
     private let overlapDays = 1
 
     /// sleep 数据缓存：sleep、respiratoryRate、hrv 三个类型共享同一份睡眠原始数据，
-    /// 避免同一次同步中把 sleep key 下载三遍。按 (startTime, endTime) 命中缓存。
-    private var sleepCache: (startTime: Int, endTime: Int, items: [MiItem])?
+    /// 避免同一次同步中把 sleep key 下载三遍。按 `startTime-endTime` 分片键命中缓存。
+    private var sleepCache: [String: [MiItem]] = [:]
+
+    /// 本轮同步已写入的 externalUUID 集合，防止跨时间切片边界的样本被重复写入或误删。
+    private var writtenExternalIDs: Set<String> = []
 
     init(client: MiAPIClient = MiAPIClient(), writer: HealthWriter = HealthWriter()) {
         self.client = client
@@ -32,16 +47,18 @@ actor SyncEngine {
 
     /// 清除内部缓存，在一次同步会话开始前调用。
     func clearCache() {
-        sleepCache = nil
+        sleepCache.removeAll()
+        writtenExternalIDs.removeAll()
     }
 
-    /// 获取睡眠原始数据，带缓存（相同时间窗口只下载一次）。
+    /// 获取睡眠原始数据，带缓存（相同时间切片窗口只下载一次）。
     private func fetchSleepData(startTime: Int, endTime: Int) async throws -> [MiItem] {
-        if let cache = sleepCache, cache.startTime == startTime, cache.endTime == endTime {
-            return cache.items
+        let key = "\(startTime)-\(endTime)"
+        if let cached = sleepCache[key] {
+            return cached
         }
         let items = try await client.fetchData(key: "sleep", startTime: startTime, endTime: endTime)
-        sleepCache = (startTime, endTime, items)
+        sleepCache[key] = items
         return items
     }
 
@@ -51,95 +68,86 @@ actor SyncEngine {
         self.userId = userId
     }
 
-    /// 同步一类数据。
-    /// - Parameters:
-    ///   - highWater: 上次游标；`nil` 表示首次同步
-    ///   - backfillDays: 回填天数（仅在无游标或 `forceBackfill` 时生效）
-    ///   - forceBackfill: 为 true 时忽略游标，按 `backfillDays` 重新拉取历史
-    func sync(
-        type: SyncDataType, highWater: Date?, backfillDays: Int, forceBackfill: Bool = false
+    /// 同步单个时间切片的数据，供调用方在每段完成后立即持久化游标。
+    func syncSlice(
+        type: SyncDataType, slice: SyncWindowSlice, forceBackfill: Bool = false
     ) async throws -> SyncOutcome {
-        let now = Date()
-        let start: Date
-        if forceBackfill {
-            // 重新回填：忽略游标，按所选天数重拉历史
-            start = Calendar.current.date(byAdding: .day, value: -backfillDays, to: now) ?? now
-        } else if let highWater {
-            // 增量：从上次游标往前重叠一天，避免迟到数据被漏掉
-            start = Calendar.current.date(byAdding: .day, value: -overlapDays, to: highWater) ?? highWater
-        } else {
-            // 首次同步：按所选天数回填
-            start = Calendar.current.date(byAdding: .day, value: -backfillDays, to: now) ?? now
-        }
-        let startTime = MiAPIClient.dayStartEpoch(of: start)
-        let endTime = MiAPIClient.dayEndEpoch(of: now)
+        try Task.checkCancellation()
 
         // 运动记录用 HKWorkoutBuilder 单独写入（不走通用分组保存）
         if type == .workouts {
             return try await syncWorkouts(
-                startTime: startTime, endTime: endTime, start: start, end: now,
+                startTime: slice.startTime, endTime: slice.endTime,
+                start: slice.start, end: slice.end, highWater: slice.highWater,
                 forceBackfill: forceBackfill
             )
         }
 
-        let groups = try await fetchAndMap(type: type, startTime: startTime, endTime: endTime)
+        let groups = try await fetchAndMap(
+            type: type, startTime: slice.startTime, endTime: slice.endTime
+        )
 
         var added = 0
         var fetched = 0
         for group in groups {
+            try Task.checkCancellation()
             let existing = try await writer.existingExternalIDs(
-                ofType: group.sampleType, start: start, end: now
+                ofType: group.sampleType, start: slice.start, end: slice.end
             )
             if forceBackfill {
-                // 重新回填 = 重写：删除范围内**我们已写入的所有样本**（外部 ID 匹配），再插入最新数据。
-                // 删除全部而非仅交集，是为了清理旧版写入的已废弃样本（如旧的整晚 asleep 聚合样本）。
-                // 分块删除，避免单个谓词过长（大量样本时）。
-                if !existing.isEmpty {
+                // 重新回填 = 重写：删除当前切片范围内已写入的旧样本（排除本轮前序切片刚写入的跨日边界样本），再插入最新数据。
+                let toDelete = existing.subtracting(writtenExternalIDs)
+                if !toDelete.isEmpty {
                     let chunkSize = 500
-                    let all = Array(existing)
+                    let all = Array(toDelete)
                     for index in stride(from: 0, to: all.count, by: chunkSize) {
                         let end = min(index + chunkSize, all.count)
-                        try await writer.delete(ofType: group.sampleType, externalIDs: Set(all[index..<end]))
+                        try await writer.delete(
+                            ofType: group.sampleType, externalIDs: Set(all[index..<end])
+                        )
                     }
                 }
-                try await writer.save(group.objects)
-                added += group.objects.count
+                let objectsToSave = group.objects.filter { object in
+                    guard let uuid = object.metadata?[HKMetadataKeyExternalUUID] as? String else {
+                        return true
+                    }
+                    return !writtenExternalIDs.contains(uuid)
+                }
+                try await writer.save(objectsToSave)
+                recordWrittenIDs(from: objectsToSave)
+                added += objectsToSave.count
             } else {
                 let fresh = group.objects.filter { object in
                     guard let uuid = object.metadata?[HKMetadataKeyExternalUUID] as? String else {
                         return true
                     }
-                    return !existing.contains(uuid)
+                    return !existing.contains(uuid) && !writtenExternalIDs.contains(uuid)
                 }
                 try await writer.save(fresh)
+                recordWrittenIDs(from: fresh)
                 added += fresh.count
             }
             fetched += group.objects.count
         }
 
-        return SyncOutcome(type: type, fetched: fetched, added: added, highWater: now)
+        return SyncOutcome(type: type, fetched: fetched, added: added, highWater: slice.highWater)
     }
 
-    /// 压力数据同步：从云端拉取 stress key，返回解析后的压力样本。
-    /// 压力数据无 HealthKit 对应类型，由 AppModel 写入 SwiftData。
-    /// - Returns: (压力样本列表, 同步结果摘要)
-    func syncStress(
-        highWater: Date?, backfillDays: Int, forceBackfill: Bool = false
-    ) async throws -> (samples: [MiStressSample], outcome: SyncOutcome) {
-        let (start, now, startTime, endTime) = syncWindow(
-            highWater: highWater, backfillDays: backfillDays, forceBackfill: forceBackfill
+    /// 拉取单个时间切片的压力数据样本。
+    /// 压力数据无 HealthKit 对应类型，由 AppModel 按切片写入 SwiftData。
+    func fetchStressSlice(slice: SyncWindowSlice) async throws -> [MiStressSample] {
+        try Task.checkCancellation()
+        let items = try await client.fetchData(
+            key: "stress", startTime: slice.startTime, endTime: slice.endTime
         )
-        let items = try await client.fetchData(key: "stress", startTime: startTime, endTime: endTime)
-        let samples = MiParser.stressSamples(items)
-        return (samples, SyncOutcome(type: .stress, fetched: samples.count, added: 0, highWater: now))
+        return MiParser.stressSamples(items)
     }
 
     // MARK: - 窗口计算
 
     func syncWindow(
-        highWater: Date?, backfillDays: Int, forceBackfill: Bool
+        highWater: Date?, backfillDays: Int, forceBackfill: Bool, now: Date = Date()
     ) -> (start: Date, end: Date, startTime: Int, endTime: Int) {
-        let now = Date()
         let start: Date
         if forceBackfill {
             start = Calendar.current.date(byAdding: .day, value: -backfillDays, to: now) ?? now
@@ -149,6 +157,31 @@ actor SyncEngine {
             start = Calendar.current.date(byAdding: .day, value: -backfillDays, to: now) ?? now
         }
         return (start, now, MiAPIClient.dayStartEpoch(of: start), MiAPIClient.dayEndEpoch(of: now))
+    }
+
+    /// 将总同步时间区间按 `chunkDays`（默认 30 天）切分为连续子窗口，供逐段拉取与推进游标。
+    func syncWindows(
+        highWater: Date?, backfillDays: Int, forceBackfill: Bool,
+        chunkDays: Int = MiAPIClient.maxChunkDays, now: Date = Date()
+    ) -> [SyncWindowSlice] {
+        let (_, overallEnd, startTime, endTime) = syncWindow(
+            highWater: highWater, backfillDays: backfillDays, forceBackfill: forceBackfill, now: now
+        )
+        let chunks = MiAPIClient.timeChunks(
+            startTime: startTime, endTime: endTime, chunkDays: chunkDays
+        )
+        return chunks.enumerated().map { index, chunk in
+            let sliceStart = Date(timeIntervalSince1970: TimeInterval(chunk.startTime))
+            let sliceEnd = Date(timeIntervalSince1970: TimeInterval(chunk.endTime))
+            let highWater = index == chunks.count - 1 ? overallEnd : sliceEnd
+            return SyncWindowSlice(
+                start: sliceStart,
+                end: sliceEnd,
+                startTime: chunk.startTime,
+                endTime: chunk.endTime,
+                highWater: highWater
+            )
+        }
     }
 
     // MARK: - 取数与映射
@@ -203,18 +236,18 @@ actor SyncEngine {
             return groupBySampleType(samples)
 
         case .stress:
-            // 压力数据不走 HealthKit，由 syncStress 方法处理
+            // 压力数据不走 HealthKit，由 fetchStressSlice 方法处理
             return []
 
         case .workouts:
-            // 不会走到这里：sync() 已将运动路由到 syncWorkouts（HKWorkoutBuilder 专用）
+            // 不会走到这里：syncSlice() 已将运动路由到 syncWorkouts（HKWorkoutBuilder 专用）
             return []
         }
     }
 
     /// 运动记录：取数 → 生成草稿 → 用 HKWorkoutBuilder 逐条写入（按 externalUUID 去重）。
     private func syncWorkouts(
-        startTime: Int, endTime: Int, start: Date, end: Date, forceBackfill: Bool
+        startTime: Int, endTime: Int, start: Date, end: Date, highWater: Date, forceBackfill: Bool
     ) async throws -> SyncOutcome {
         let items = try await client.fetchSportRecords(startTime: startTime, endTime: endTime)
         let drafts = MiParser.workouts(items).compactMap(TypeMapper.workoutDraft)
@@ -223,6 +256,8 @@ actor SyncEngine {
 
         var added = 0
         for draft in drafts {
+            try Task.checkCancellation()
+            guard !writtenExternalIDs.contains(draft.externalUUID) else { continue }
             if forceBackfill {
                 if existing.contains(draft.externalUUID) {
                     try await writer.delete(ofType: workoutType, externalIDs: [draft.externalUUID])
@@ -235,13 +270,23 @@ actor SyncEngine {
                     try await writer.delete(ofType: hrType, externalIDs: hrIDs)
                 }
                 _ = try await writer.saveWorkout(draft)
+                writtenExternalIDs.insert(draft.externalUUID)
                 added += 1
             } else if !existing.contains(draft.externalUUID) {
                 _ = try await writer.saveWorkout(draft)
+                writtenExternalIDs.insert(draft.externalUUID)
                 added += 1
             }
         }
-        return SyncOutcome(type: .workouts, fetched: drafts.count, added: added, highWater: Date())
+        return SyncOutcome(type: .workouts, fetched: drafts.count, added: added, highWater: highWater)
+    }
+
+    private func recordWrittenIDs(from objects: [HKObject]) {
+        for object in objects {
+            if let uuid = object.metadata?[HKMetadataKeyExternalUUID] as? String {
+                writtenExternalIDs.insert(uuid)
+            }
+        }
     }
 
     /// 按 HealthKit 样本类型分组（同一个同步批次内的不同 HK 类型需要分别去重）。

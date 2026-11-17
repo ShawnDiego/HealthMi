@@ -3,6 +3,7 @@ import HealthKit
 import Observation
 import os
 import SwiftData
+import os
 
 enum AppError: LocalizedError {
     case noCredentials
@@ -206,63 +207,87 @@ final class AppModel {
         let types = SyncDataType.allCases.filter { enabledTypes.contains($0) }
         totalSyncCount = types.count
         currentSyncIndex = 0
+        let syncNow = Date()
         await engine?.clearCache()
         for type in types {
             currentSyncIndex += 1
             // 后台同步被系统取消时，尽早退出
             if Task.isCancelled { break }
+            AppLog.apiClient.info(
+                "[总进度 \(self.currentSyncIndex, privacy: .public)/\(self.totalSyncCount, privacy: .public)] 正在同步: \(type.displayName, privacy: .public)"
+            )
             let highWater = SyncStateStore.state(for: type, in: modelContext)?.lastSyncedEnd
+            guard let engine else { break }
+            let slices = await engine.syncWindows(
+                highWater: highWater,
+                backfillDays: backfillDays,
+                forceBackfill: forceBackfill,
+                now: syncNow
+            )
+            var totalFetched = 0
+            var totalAdded = 0
+            var latestHighWater = syncNow
             do {
                 if type == .stress {
-                    // 压力数据不走 HealthKit，走 SwiftData
-                    let result = try await engine?.syncStress(
-                        highWater: highWater, backfillDays: backfillDays,
-                        forceBackfill: forceBackfill
-                    )
-                    if let result {
+                    // 压力数据不走 HealthKit，走 SwiftData；按时间切片逐段写入并推进游标
+                    for slice in slices {
+                        try Task.checkCancellation()
+                        let samples = try await engine.fetchStressSlice(slice: slice)
                         if forceBackfill {
-                            StressStore.clearAll(in: modelContext)
+                            StressStore.deleteRange(start: slice.start, end: slice.end, in: modelContext)
                         }
-                        let added = StressStore.save(samples: result.samples, in: modelContext)
-                        let outcome = SyncOutcome(
-                            type: .stress, fetched: result.samples.count,
-                            added: added, highWater: result.outcome.highWater
-                        )
+                        let added = StressStore.save(samples: samples, in: modelContext)
+                        totalFetched += samples.count
+                        totalAdded += added
+                        latestHighWater = slice.highWater
                         SyncStateStore.record(
-                            type: .stress, highWater: outcome.highWater,
+                            type: .stress, highWater: slice.highWater,
                             added: added, in: modelContext
                         )
-                        outcomes[.stress] = outcome
-                        messages.append("压力 +\(added)")
-                        SyncLogStore.append(
-                            type: .stress, fetched: result.samples.count,
-                            added: added, success: true, in: modelContext
-                        )
                     }
-                } else {
-                    let outcome = try await engine?.sync(
-                        type: type, highWater: highWater, backfillDays: backfillDays,
-                        forceBackfill: forceBackfill
+                    let outcome = SyncOutcome(
+                        type: .stress, fetched: totalFetched,
+                        added: totalAdded, highWater: latestHighWater
                     )
-                    if let outcome {
-                        SyncStateStore.record(
-                            type: type, highWater: outcome.highWater,
-                            added: outcome.added, in: modelContext
+                    outcomes[.stress] = outcome
+                    messages.append("压力 +\(totalAdded)")
+                    SyncLogStore.append(
+                        type: .stress, fetched: totalFetched,
+                        added: totalAdded, success: true, in: modelContext
+                    )
+                } else {
+                    for slice in slices {
+                        try Task.checkCancellation()
+                        let sliceOutcome = try await engine.syncSlice(
+                            type: type, slice: slice, forceBackfill: forceBackfill
                         )
-                        outcomes[type] = outcome
-                        messages.append("\(type.displayName) +\(outcome.added)")
-                        SyncLogStore.append(
-                            type: type, fetched: outcome.fetched,
-                            added: outcome.added, success: true, in: modelContext
+                        totalFetched += sliceOutcome.fetched
+                        totalAdded += sliceOutcome.added
+                        latestHighWater = sliceOutcome.highWater
+                        SyncStateStore.record(
+                            type: type, highWater: sliceOutcome.highWater,
+                            added: sliceOutcome.added, in: modelContext
                         )
                     }
+                    let outcome = SyncOutcome(
+                        type: type, fetched: totalFetched,
+                        added: totalAdded, highWater: latestHighWater
+                    )
+                    outcomes[type] = outcome
+                    messages.append("\(type.displayName) +\(totalAdded)")
+                    SyncLogStore.append(
+                        type: type, fetched: totalFetched,
+                        added: totalAdded, success: true, in: modelContext
+                    )
                 }
+            } catch is CancellationError {
+                break
             } catch {
                 let message = "\(type.displayName)：\(Self.describeSyncError(error))"
                 lastError = message
                 messages.append("\(type.displayName) ❌")
                 SyncLogStore.append(
-                    type: type, fetched: 0, added: 0,
+                    type: type, fetched: totalFetched, added: totalAdded,
                     success: false, errorMessage: Self.describeSyncError(error), in: modelContext
                 )
             }
