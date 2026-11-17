@@ -252,7 +252,7 @@ actor SyncEngine {
     func syncStress(
         highWater: Date?, backfillDays: Int, forceBackfill: Bool = false
     ) async throws -> (samples: [MiStressSample], outcome: SyncOutcome) {
-        let (start, now, startTime, endTime) = syncWindow(
+        let (_, now, startTime, endTime) = syncWindow(
             highWater: highWater, backfillDays: backfillDays, forceBackfill: forceBackfill
         )
         let items = try await client.fetchData(key: "stress", startTime: startTime, endTime: endTime)
